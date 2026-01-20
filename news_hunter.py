@@ -8,7 +8,7 @@ from datetime import datetime
 import concurrent.futures
 
 # ================= 1. 系统配置 =================
-st.set_page_config(page_title="🚀 A股操盘手 V38 (手动版)", layout="wide", page_icon="💰")
+st.set_page_config(page_title="A股操盘手 V39", layout="wide", page_icon="💰")
 
 # 初始化状态
 if 'watchlist' not in st.session_state: st.session_state.watchlist = {}
@@ -62,11 +62,11 @@ def fetch_sector_map():
 
 def get_individual_fund_flow(code):
     try:
+        # 优化：只取最近几行，减少数据处理量
         df = ak.stock_individual_fund_flow(stock=code, market="sh" if code.startswith("6") else "sz")
         if df.empty: return 0.0
-        df = df.sort_values(by='日期', ascending=False)
-        latest = df.iloc[0]
-        net_flow = latest['主力净流入-净额']
+        df = df.tail(1) # 只需要最后一行
+        net_flow = df.iloc[0]['主力净流入-净额']
         return float(net_flow) / 100000000.0 
     except: return 0.0
 
@@ -85,6 +85,23 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
         current_pct = spot_row['涨跌幅']
         pe, turnover = spot_row['市盈率-动态'], spot_row['换手率']
         
+        # 1. 基础数据获取
+        df_day = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
+        if df_day.empty or len(df_day) < 60: return None
+        
+        # 2. 快速初筛 (在拉取更多数据前先过滤，提升速度)
+        close = df_day['收盘'].iloc[-1]
+        ma20 = df_day['收盘'].rolling(20).mean().iloc[-1]
+        ma60 = df_day['收盘'].rolling(60).mean().iloc[-1]
+        vol_5 = df_day['成交量'].tail(5).mean()
+        vol_20 = df_day['成交量'].tail(20).mean()
+        
+        if strict_mode:
+            # 如果处于明显下降通道，直接跳过，不再请求行业和资金数据（省时间）
+            if close < ma20: return None
+            if vol_5 < 1.0 * vol_20: return None # 稍微放宽缩量限制
+        
+        # 3. 深入数据获取 (只有初筛通过才跑这些)
         industry = get_stock_industry(code)
         sector_pct = 0.0
         if sector_map and industry in sector_map:
@@ -92,14 +109,6 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
             
         individual_flow = get_individual_fund_flow(code)
         
-        df_day = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
-        if df_day.empty or len(df_day) < 60: return None
-        
-        close = df_day['收盘'].iloc[-1]
-        ma20 = df_day['收盘'].rolling(20).mean().iloc[-1]
-        ma60 = df_day['收盘'].rolling(60).mean().iloc[-1]
-        vol_5 = df_day['成交量'].tail(5).mean()
-        vol_20 = df_day['成交量'].tail(20).mean()
         vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 0
         
         atr_series = calculate_atr(df_day)
@@ -114,11 +123,10 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
         recent_20 = df_day.tail(20)
         has_limit_up = (recent_20['涨跌幅'] > 9.5).any()
         
+        # 二次严格过滤
         if strict_mode:
-            if close < ma20: return None
-            if vol_5 < 1.5 * vol_20: return None
             if is_high_risk: return None 
-            if sector_pct < -1.5: return None
+            if sector_pct < -2.0: return None # 板块不能太崩
         
         df_60m = ak.stock_zh_a_hist_min_em(symbol=code, period='60', adjust='qfq')
         
@@ -128,7 +136,7 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
         
         if 0 < pe < 60: score += 10
         else: score -= 5
-        if turnover > 3.0: score += 10
+        if turnover > 5.0: score += 10 # 换手率门槛提高
         if close > ma20: score += 10
         else: score -= 20; is_broken = True
         if vol_ratio > 1.5: score += 10; reasons.append("✅放量")
@@ -138,10 +146,10 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
             
         if has_limit_up: score += 15; reasons.insert(0, "🧬妖股基因")
         
-        if individual_flow > 0.5:
+        if individual_flow > 0.3:
             score += 20; reasons.insert(0, f"💸主力买{individual_flow:.1f}亿")
         elif individual_flow > 0.1: score += 5
-        elif individual_flow < -0.5:
+        elif individual_flow < -0.3:
             score -= 20; reasons.append(f"🩸主力逃{abs(individual_flow):.1f}亿")
             
         advice_60m = "⚖️ 分时震荡"
@@ -258,7 +266,7 @@ def get_watchlist_updates():
 # ================= 5. 页面布局 =================
 
 with st.sidebar:
-    st.header("💸 A股操盘手 V38")
+    st.header("💸 A股操盘手 V39")
     st.caption("🔒 模式：手动刷新")
     
     if st.button("🔄 手动刷新行情", type="primary"):
@@ -299,7 +307,7 @@ with st.sidebar:
     page = st.radio("功能模式:", ["⚡ 极速实战扫描", "📊 个股深度诊疗", "📂 资产看板"])
 
 if page == "⚡ 极速实战扫描":
-    st.title("⚡ 资金穿透·狙击手 V38")
+    # 🔥🔥🔥 优化：已去除大标题
     
     col_env1, col_env2 = st.columns(2)
     with col_env1:
@@ -320,15 +328,18 @@ if page == "⚡ 极速实战扫描":
     with col1: st.info("筛选：主板 + 主力 + **资金穿透** | 排序：Alpha + 妖股基因")
     
     if col2.button("🚀 立即扫描", type="primary"):
-        with st.spinner("🚀 全市场资金扫描中..."):
+        with st.spinner("🚀 全市场资金扫描中 (Turbo Mode)..."):
             try:
                 df_spot = ak.stock_zh_a_spot_em()
+                # 过滤 ST、科创、北交所、低流动性
                 mask = (~df_spot['名称'].str.contains("ST") & ~df_spot['代码'].str.startswith(("688", "8", "4", "9")) & (df_spot['换手率'] > 3.0) & (df_spot['市盈率-动态'] < 80))
-                candidates = df_spot[mask].sort_values(by='换手率', ascending=False).head(80)
+                candidates = df_spot[mask].sort_values(by='换手率', ascending=False).head(80) # 保持前80，但通过线程加速
                 
                 tasks = [(r['代码'], r['名称'], r, market_factor, sector_map) for _, r in candidates.iterrows()]
                 results = []
-                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                
+                # 🔥🔥🔥 优化：线程数从 10 提升到 32，大幅提升网络请求并发量
+                with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
                     futures = {executor.submit(analyze_stock_task, t): t for t in tasks}
                     for f in concurrent.futures.as_completed(futures):
                         res = f.result()
@@ -336,7 +347,7 @@ if page == "⚡ 极速实战扫描":
                 
                 if results:
                     st.session_state.scan_results = pd.DataFrame(results).sort_values(by='排序权重', ascending=False)
-                    st.success(f"命中 {len(results)} 只标的。")
+                    st.success(f"⚡ 极速扫描完成：命中 {len(results)} 只标的。")
                 else:
                     st.session_state.scan_results = pd.DataFrame()
                     st.warning("无符合条件标的。")
@@ -391,7 +402,7 @@ if page == "⚡ 极速实战扫描":
                 st.markdown("---")
 
 elif page == "📊 个股深度诊疗":
-    st.title("🏥 个股深度诊疗 V38")
+    st.title("🏥 个股深度诊疗 V39")
     market_status, market_factor = fetch_market_sentiment()
     if 'sector_map' not in st.session_state: st.session_state.sector_map = fetch_sector_map()
     sector_map = st.session_state.sector_map
