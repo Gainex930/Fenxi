@@ -6,10 +6,9 @@ import time
 import plotly.graph_objects as go
 from datetime import datetime
 import concurrent.futures
-import re
 
 # ================= 1. 系统配置 =================
-st.set_page_config(page_title="🚀 A股操盘手 V38 (手动刷新版)", layout="wide", page_icon="💰")
+st.set_page_config(page_title="🚀 A股操盘手 V38 (手动版)", layout="wide", page_icon="💰")
 
 # 初始化状态
 if 'watchlist' not in st.session_state: st.session_state.watchlist = {}
@@ -17,7 +16,6 @@ if 'scan_results' not in st.session_state: st.session_state.scan_results = None
 if 'diagnosis_result' not in st.session_state: st.session_state.diagnosis_result = None
 if 'sector_map' not in st.session_state: st.session_state.sector_map = {} 
 if 'latest_prices' not in st.session_state: st.session_state.latest_prices = {}
-# 记录上次手动更新的时间 (默认为空)
 if 'last_update_str' not in st.session_state: st.session_state.last_update_str = "未刷新"
 
 # 数据迁移兼容
@@ -75,8 +73,8 @@ def get_individual_fund_flow(code):
 def get_stock_industry(code):
     try:
         df = ak.stock_individual_info_em(symbol=code)
-        industry = df[df['item'] == '行业']['value'].values[0]
-        return industry
+        val = df[df['item'] == '行业']['value'].values
+        return val[0] if len(val) > 0 else "其他"
     except: return "其他"
 
 # ================= 3. 核心分析逻辑 =================
@@ -208,7 +206,7 @@ def diagnose_single_stock(code, market_factor, sector_map):
         return res, None
     except Exception as e: return None, str(e)
 
-# ================= 4. 绘图与强力数据更新 =================
+# ================= 4. 绘图与数据更新 =================
 
 def draw_mini_chart(df):
     if df is None: return go.Figure()
@@ -235,13 +233,11 @@ def draw_detail_chart(df, name):
     fig.update_layout(title=f"{name} 日线趋势", height=350, xaxis_rangeslider_visible=False, plot_bgcolor='rgba(0,0,0,0)', yaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'))
     return fig
 
-# --- 纯手动刷新逻辑 ---
 def get_watchlist_updates():
     if not st.session_state.watchlist: return {}
     
     updates = {}
     try:
-        # 批量获取全市场数据
         df = ak.stock_zh_a_spot_em()
         df['代码'] = df['代码'].astype(str)
         
@@ -254,7 +250,6 @@ def get_watchlist_updates():
                 pct = float(row.iloc[0]['涨跌幅'])
                 updates[code_str] = {'price': price, 'pct': pct}
         
-        # 更新时间戳显示
         st.session_state.last_update_str = datetime.now().strftime('%H:%M:%S')
         return updates
     except Exception:
@@ -266,7 +261,6 @@ with st.sidebar:
     st.header("💸 A股操盘手 V38")
     st.caption("🔒 模式：手动刷新")
     
-    # 强制刷新按钮 (只有点这个才会变数据)
     if st.button("🔄 手动刷新行情", type="primary"):
         with st.spinner("正在连接交易所..."):
             st.session_state.latest_prices = get_watchlist_updates()
@@ -274,10 +268,8 @@ with st.sidebar:
         time.sleep(0.5)
         st.rerun()
     
-    # 显示上次更新时间
     st.info(f"🕒 数据锁定于: {st.session_state.last_update_str}")
     
-    # 初始加载：如果一次都没刷过，自动刷一次，避免进来是空的
     if not st.session_state.latest_prices and st.session_state.watchlist:
         st.session_state.latest_prices = get_watchlist_updates()
         st.rerun()
@@ -288,8 +280,6 @@ with st.sidebar:
         st.markdown("---")
         for code, info in st.session_state.watchlist.items():
             name = info['name']
-            
-            # 安全获取
             price_data = latest_prices.get(code, {'price': info.get('cost', 0), 'pct': 0.0})
             curr = price_data['price']
             
@@ -308,7 +298,6 @@ with st.sidebar:
     
     page = st.radio("功能模式:", ["⚡ 极速实战扫描", "📊 个股深度诊疗", "📂 资产看板"])
 
-# --- 页面 1: 扫描 ---
 if page == "⚡ 极速实战扫描":
     st.title("⚡ 资金穿透·狙击手 V38")
     
@@ -401,7 +390,6 @@ if page == "⚡ 极速实战扫描":
                         st.rerun()
                 st.markdown("---")
 
-# --- 页面 2: 诊股 ---
 elif page == "📊 个股深度诊疗":
     st.title("🏥 个股深度诊疗 V38")
     market_status, market_factor = fetch_market_sentiment()
@@ -443,12 +431,10 @@ elif page == "📊 个股深度诊疗":
                 st.session_state.watchlist[res['代码']] = {'name': res['名称'], 'cost': res['现价'], 'add_time': datetime.now().strftime('%m-%d')}
                 st.rerun()
 
-# --- 页面 3: 资产看板 (完全手动) ---
 elif page == "📂 资产看板":
     st.title("📂 资产看板")
     st.caption(f"数据快照时间: {st.session_state.last_update_str} (请手动点击刷新获取最新数据)")
     
-    # 手动刷新按钮
     if st.button("🔄 手动刷新列表", type="primary"):
         with st.spinner("正在拉取最新行情..."):
             st.session_state.latest_prices = get_watchlist_updates()
@@ -459,10 +445,9 @@ elif page == "📂 资产看板":
     else:
         data = []
         for code, info in st.session_state.watchlist.items():
-            # 安全获取最新价格和涨跌幅
             price_data = latest_prices.get(code, {'price': info.get('cost', 0), 'pct': 0.0})
             curr = price_data['price']
-            daily_pct = price_data['pct'] # 当日涨跌幅
+            daily_pct = price_data['pct'] 
             
             cost = info.get('cost', 0)
             total_gain = (curr - cost) / cost * 100 if cost > 0 else 0
@@ -472,11 +457,10 @@ elif page == "📂 资产看板":
                 "名称": info['name'],
                 "成本": cost,
                 "现价": curr,
-                "当日涨跌%": daily_pct,  # 修复后的列
+                "当日涨跌%": daily_pct, 
                 "累计盈亏%": total_gain
             })
         
-        # 样式渲染
         st.dataframe(
             pd.DataFrame(data), 
             column_config={
