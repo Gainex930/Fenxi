@@ -11,7 +11,7 @@ import concurrent.futures
 from github import Github, GithubException
 
 # ================= 1. 系统配置 =================
-st.set_page_config(page_title="A股操盘手 V53", layout="wide", page_icon="♾️")
+st.set_page_config(page_title="A股操盘手 V54", layout="wide", page_icon="⚡")
 
 # --- 核心：GitHub 云端持久化层 ---
 USER_DATA_FILE = "sentinel_userdata.json"
@@ -26,7 +26,6 @@ def get_github_repo():
     except Exception as e:
         return None
 
-# --- 用户配置读写 (不变) ---
 def load_userdata():
     if 'user_data_loaded' in st.session_state:
         return {"watchlist": st.session_state.watchlist, "portfolio": st.session_state.strategy_portfolio}
@@ -55,28 +54,18 @@ def save_userdata():
         try: repo.create_file(path=USER_DATA_FILE, message="[Init] User Data", content=json_str)
         except: pass
 
-# --- 🔥 V53: 强制全时段云备份 ---
 def save_market_snapshot(df):
-    """
-    无论何时调用，都会强制将当前 DataFrame 上传到 GitHub。
-    """
     repo = get_github_repo()
     if not repo: return
-    
-    # 获取当前时间 (北京时间估算: UTC+8)
-    # Streamlit Cloud 是 UTC 时间，所以加 8 小时
     utc_now = datetime.utcnow()
     bj_now = utc_now + timedelta(hours=8)
     time_str = bj_now.strftime('%Y-%m-%d %H:%M:%S')
-    
     snapshot_data = {
         "timestamp": time_str,
         "count": len(df),
         "data": df.to_dict(orient='records')
     }
-    # 压缩 JSON 以加快上传速度
     json_str = json.dumps(snapshot_data, ensure_ascii=False, separators=(',', ':'))
-    
     try:
         try:
             contents = repo.get_contents(MARKET_DATA_FILE)
@@ -90,57 +79,45 @@ def save_market_snapshot(df):
         return time_str
 
 def load_market_snapshot():
-    """启动时从 GitHub 拉取数据"""
     repo = get_github_repo()
     if not repo: return pd.DataFrame(), "未连接"
-    
     try:
         contents = repo.get_contents(MARKET_DATA_FILE)
         data_packet = json.loads(contents.decoded_content.decode("utf-8"))
-        
         df = pd.DataFrame(data_packet['data'])
         if '代码' in df.columns:
             df['代码'] = df['代码'].astype(str)
-            
         return df, data_packet.get('timestamp', '未知时间')
     except Exception:
         return pd.DataFrame(), "无云端存档"
 
-# ================= 初始化逻辑 (启动即恢复) =================
-
-# 1. 加载用户数据
+# ================= 初始化 =================
 with st.spinner("☁️ 正在同步账户数据..."):
     user_data = load_userdata()
 
 if 'watchlist' not in st.session_state: st.session_state.watchlist = user_data.get("watchlist", {})
 if 'strategy_portfolio' not in st.session_state: st.session_state.strategy_portfolio = user_data.get("portfolio", {})
 
-# 2. 🔥 V53 核心：自动恢复行情现场
 if 'market_snapshot' not in st.session_state:
     st.session_state.market_snapshot = pd.DataFrame()
     st.session_state.last_update_str = "等待加载..."
     st.session_state.data_source = "未知"
-    
-    # 尝试从云端拉取
-    with st.spinner("📥 正在从云端恢复上次的行情现场..."):
+    with st.spinner("📥 正在从云端恢复行情..."):
         df_snap, snap_time = load_market_snapshot()
         if not df_snap.empty:
             st.session_state.market_snapshot = df_snap
             st.session_state.last_update_str = snap_time
             st.session_state.data_source = "☁️ 云端存档"
-            # 只有第一次加载时提示，避免烦人
-            st.toast(f"已恢复 {snap_time} 的行情数据，无需重新下载！")
+            st.toast(f"已恢复 {snap_time} 的行情数据")
         else:
-            st.session_state.last_update_str = "无存档，请刷新"
+            st.session_state.last_update_str = "无存档"
 
-# 其他状态
 if 'scan_results' not in st.session_state: st.session_state.scan_results = None
 if 'diagnosis_result' not in st.session_state: st.session_state.diagnosis_result = None
 if 'page_idx_attack' not in st.session_state: st.session_state.page_idx_attack = 0
 if 'page_idx_ambush' not in st.session_state: st.session_state.page_idx_ambush = 0
 
-# ================= 2. 数据获取层 (API) =================
-
+# ================= 数据接口 =================
 @st.cache_data(ttl=3600*4) 
 def fetch_basic_info():
     try:
@@ -167,8 +144,7 @@ def fetch_market_sentiment_cached():
         else: return "🌧️ 大盘空头 (轻仓)", 0.8
     except: return "未知环境", 1.0
 
-# ================= 3. 核心算法 =================
-# ... (标准算法库，保持 V51 一致) ...
+# ================= 核心算法 =================
 def calculate_atr(df, period=14):
     high_low = df['最高'] - df['最低']; high_close = np.abs(df['最高'] - df['收盘'].shift()); low_close = np.abs(df['最低'] - df['收盘'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1); true_range = np.max(ranges, axis=1)
@@ -203,25 +179,36 @@ def get_stock_industry(code):
 
 def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None, strict_mode=True):
     try:
+        # 1. 基础数据
         current_price = spot_row['最新价']; current_pct = spot_row['涨跌幅']; pe, turnover = spot_row['市盈率-动态'], spot_row['换手率']
+        
+        # 2. 网络请求 (最耗时步骤)
         df_day = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
         if df_day.empty or len(df_day) < 60: return None
+        
         close = df_day['收盘'].iloc[-1]; ma20 = df_day['收盘'].rolling(20).mean().iloc[-1]; ma60 = df_day['收盘'].rolling(60).mean().iloc[-1]
         vol_5 = df_day['成交量'].tail(5).mean(); vol_20 = df_day['成交量'].tail(20).mean()
+        
+        # 快速过滤 (减少后续计算)
         if strict_mode:
-            if close < ma20: return None
+            if close < ma20: return None # 破位不看
             if vol_5 < 1.0 * vol_20: return None
+        
         industry = get_stock_industry(code); sector_pct = 0.0
         if sector_map and industry in sector_map: sector_pct = sector_map[industry]
         individual_flow = get_individual_fund_flow(code); vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 0
         atr_val = calculate_atr(df_day).iloc[-1]; stop_loss_pct = (max(0, close - 2 * atr_val) - close) / close * 100
         bias_60 = (close - ma60) / ma60 * 100; is_high_risk = bias_60 > 30; alpha = current_pct - sector_pct
         has_limit_up = (df_day.tail(20)['涨跌幅'] > 9.5).any()
+        
         if strict_mode:
             if is_high_risk: return None 
             if sector_pct < -2.0: return None
+            
         df_60m = ak.stock_zh_a_hist_min_em(symbol=code, period='60', adjust='qfq')
         score = 60.0; reasons = []; is_broken = False
+        
+        # 评分逻辑... (略，保持一致)
         if 0 < pe < 60: score += 10
         else: score -= 5
         if turnover > 5.0: score += 10
@@ -271,8 +258,7 @@ def diagnose_single_stock(code, market_factor, sector_map):
         return res, None
     except Exception as e: return None, str(e)
 
-# ================= 5. 绘图与 UI =================
-
+# ================= 绘图与 UI =================
 def draw_mini_chart_compact(df):
     if df is None: return go.Figure()
     mini_data = df.tail(20)
@@ -336,24 +322,14 @@ def render_stock_list(df_subset, page_state_key):
 
 # --- 侧边栏 ---
 with st.sidebar:
-    st.header("💸 操盘手 V53")
-    
-    # 🔥 V53 修改：刷新 = 下载 + 内存更新 + 强制云端备份
+    st.header("💸 操盘手 V54")
     if st.button("🔄 刷新全市场 (并备份)", type="primary"):
         with st.spinner("📥 1. 下载全市场数据..."):
             df = download_market_spot_data()
-        
         with st.spinner("☁️ 2. 上传至云端数据库..."):
             saved_time = save_market_snapshot(df)
-            st.session_state.market_snapshot = df
-            st.session_state.last_update_str = saved_time
-            st.session_state.data_source = "🔴 实时 (已备份)"
-            
-        st.success(f"完成！已更新 {len(df)} 只标的")
-        time.sleep(0.5)
-        st.rerun()
-    
-    # 数据源状态显示
+            st.session_state.market_snapshot = df; st.session_state.last_update_str = saved_time; st.session_state.data_source = "🔴 实时 (已备份)"
+        st.success(f"已更新 {len(df)} 只标的"); time.sleep(0.5); st.rerun()
     source_color = "red" if "实时" in st.session_state.get('data_source', '') else "blue"
     st.markdown(f"**数据源:** <span style='color:{source_color}'>{st.session_state.get('data_source', '未加载')}</span>", unsafe_allow_html=True)
     st.caption(f"数据时间: {st.session_state.last_update_str}")
@@ -370,8 +346,7 @@ with st.sidebar:
             with st.container():
                 c1, c2, c3 = st.columns([3.5, 2, 1])
                 c1.markdown(f"**{name}** {signal_icon}", unsafe_allow_html=True)
-                color = "red" if pct > 0 else "green"
-                c2.markdown(f"<span style='color:{color};font-weight:bold'>{pct:+.2f}%</span>", unsafe_allow_html=True)
+                color = "red" if pct > 0 else "green"; c2.markdown(f"<span style='color:{color};font-weight:bold'>{pct:+.2f}%</span>", unsafe_allow_html=True)
                 if c3.button("✕", key=f"del_{code}"): del st.session_state.watchlist[code]; save_userdata(); st.rerun()
             st.markdown("<hr style='margin:5px 0'>", unsafe_allow_html=True)
 
@@ -388,29 +363,37 @@ if page == "⚡ 战术扫描":
         df_sec, sector_map = fetch_basic_info(); render_sector_pills(df_sec)
 
     st.markdown("---")
-    col1, col2 = st.columns([4, 1])
-    with col1: st.info("策略：资金穿透 + 妖股基因 + **凯利风控**")
     
-    # 扫描按钮
-    if col2.button("🚀 扫描", type="primary"):
-        st.session_state.page_idx_attack = 0; st.session_state.page_idx_ambush = 0
-        with st.spinner(f"正在分析 {len(st.session_state.market_snapshot)} 只股票..."):
-            try:
-                if st.session_state.market_snapshot.empty: st.error("数据为空，请点击侧边栏刷新")
-                else:
-                    df_spot = st.session_state.market_snapshot
-                    mask = (~df_spot['名称'].str.contains("ST") & ~df_spot['代码'].str.startswith(("688", "8", "4", "9")) & (df_spot['换手率'] > 3.0) & (df_spot['市盈率-动态'] < 80))
-                    candidates = df_spot[mask].sort_values(by='换手率', ascending=False).head(60)
-                    tasks = [(r['代码'], r['名称'], r, market_factor, sector_map) for _, r in candidates.iterrows()]
-                    results = []
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                        futures = {executor.submit(analyze_stock_task, t): t for t in tasks}
-                        for f in concurrent.futures.as_completed(futures):
-                            res = f.result(); 
-                            if res: results.append(res)
-                    if results: st.session_state.scan_results = pd.DataFrame(results).sort_values(by='排序权重', ascending=False); st.success(f"命中 {len(results)} 标的")
-                    else: st.warning("无标的")
-            except Exception as e: st.error(f"Error: {e}")
+    # 🔥 V54 新增：扫描深度控制滑块
+    c_scan1, c_scan2, c_scan3 = st.columns([2, 2, 1])
+    with c_scan1: st.info("策略：资金穿透 + 妖股基因 + **凯利风控**")
+    with c_scan2: scan_depth = st.slider("🔍 扫描深度 (只看前多少名)", 20, 100, 30, help="数字越小，速度越快！推荐30。")
+    with c_scan3: 
+        if st.button("🚀 扫描", type="primary"):
+            st.session_state.page_idx_attack = 0; st.session_state.page_idx_ambush = 0
+            with st.spinner(f"🚀 正在极速分析 Top {scan_depth} 龙头股..."):
+                try:
+                    if st.session_state.market_snapshot.empty: st.error("无数据，请刷新")
+                    else:
+                        df_spot = st.session_state.market_snapshot
+                        # 1. 基础过滤：去除ST、非主板
+                        mask = (~df_spot['名称'].str.contains("ST") & ~df_spot['代码'].str.startswith(("688", "8", "4", "9")))
+                        # 2. 预筛选：只取涨幅>0的票 (不做下跌的) 进一步提速
+                        mask = mask & (df_spot['涨跌幅'] > 0)
+                        
+                        # 3. 按换手率排序，取前 N 名
+                        candidates = df_spot[mask].sort_values(by='换手率', ascending=False).head(scan_depth)
+                        
+                        tasks = [(r['代码'], r['名称'], r, market_factor, sector_map) for _, r in candidates.iterrows()]
+                        results = []
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+                            futures = {executor.submit(analyze_stock_task, t): t for t in tasks}
+                            for f in concurrent.futures.as_completed(futures):
+                                res = f.result(); 
+                                if res: results.append(res)
+                        if results: st.session_state.scan_results = pd.DataFrame(results).sort_values(by='排序权重', ascending=False); st.success(f"⚡ 完成！命中 {len(results)} 标的")
+                        else: st.warning("无标的")
+                except Exception as e: st.error(f"Error: {e}")
 
     if st.session_state.scan_results is not None and not st.session_state.scan_results.empty:
         df_res = st.session_state.scan_results
@@ -420,7 +403,7 @@ if page == "⚡ 战术扫描":
         with tab1: render_stock_list(df_attack, "page_idx_attack")
         with tab2: render_stock_list(df_ambush, "page_idx_ambush")
 
-# (以下页面逻辑保持一致，略)
+# (其他页面保持不变)
 elif page == "🤖 策略组合":
     st.title("🤖 策略组合 (实盘模拟)")
     st.caption("数据已开启硬盘级永久保存。")
