@@ -4,11 +4,12 @@ import pandas as pd
 import numpy as np
 import time
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime
 import concurrent.futures
 
 # ================= 1. 系统配置 =================
-st.set_page_config(page_title="A股操盘手 V40", layout="wide", page_icon="☁️")
+st.set_page_config(page_title="A股操盘手 V42", layout="wide", page_icon="📈")
 
 # 初始化状态
 if 'watchlist' not in st.session_state: st.session_state.watchlist = {}
@@ -23,32 +24,25 @@ try:
             st.session_state.watchlist[code] = {'name': val, 'cost': 0.0, 'add_time': datetime.now().strftime('%m-%d')}
 except: pass
 
-# ================= 2. 🔥 核心：云端数据中心 (Global Cache) =================
+# ================= 2. 🔥 核心：云端数据中心 =================
 
-@st.cache_data(ttl=3600*4) # 基础信息缓存 4小时 (板块名称等不常变)
+@st.cache_data(ttl=3600*4) 
 def fetch_basic_info():
     try:
-        # 板块数据
         df_sector = ak.stock_board_industry_name_em()
         sector_map = dict(zip(df_sector['板块名称'], df_sector['涨跌幅']))
         return sector_map
     except: return {}
 
-@st.cache_data(ttl=60) # 🔥 全市场行情缓存 60秒 (核心加速引擎)
+@st.cache_data(ttl=60) 
 def fetch_market_spot_data():
-    """
-    这是 V40 的核心。所有模块都共用这一份数据。
-    在 Streamlit Cloud 上，这份数据会被缓存到服务器内存中。
-    60秒内的所有操作都直接读内存，速度极快。
-    """
     try:
         df = ak.stock_zh_a_spot_em()
-        # 预处理：转字符串，方便后续匹配
         df['代码'] = df['代码'].astype(str)
         return df
     except: return pd.DataFrame()
 
-@st.cache_data(ttl=600) # 大盘情绪缓存 10分钟
+@st.cache_data(ttl=600) 
 def fetch_market_sentiment_cached():
     try:
         df = ak.stock_zh_index_daily(symbol="sh000001")
@@ -94,7 +88,7 @@ def get_stock_industry(code):
         return val[0] if len(val) > 0 else "其他"
     except: return "其他"
 
-# ================= 4. 业务逻辑 (对接数据中心) =================
+# ================= 4. 业务逻辑 =================
 
 def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None, strict_mode=True):
     try:
@@ -102,11 +96,9 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
         current_pct = spot_row['涨跌幅']
         pe, turnover = spot_row['市盈率-动态'], spot_row['换手率']
         
-        # 1. 基础数据 (K线) - 这个必须实时拉取，无法全局缓存
         df_day = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
         if df_day.empty or len(df_day) < 60: return None
         
-        # 2. 快速初筛
         close = df_day['收盘'].iloc[-1]
         ma20 = df_day['收盘'].rolling(20).mean().iloc[-1]
         ma60 = df_day['收盘'].rolling(60).mean().iloc[-1]
@@ -117,7 +109,6 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
             if close < ma20: return None
             if vol_5 < 1.0 * vol_20: return None
         
-        # 3. 深入数据
         industry = get_stock_industry(code)
         sector_pct = 0.0
         if sector_map and industry in sector_map:
@@ -171,7 +162,6 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
                 score -= 10; reasons.append("⏳60分死叉"); advice_60m="✋ 回调"
             df_60m_data = df_60m
             
-        # 抢筹信号
         day0, day1 = df_day.iloc[-1], df_day.iloc[-2]
         ma20_vol_s = df_day['成交量'].rolling(20).mean()
         force_signal = None
@@ -194,7 +184,8 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
             "现价": current_price, "ATR止损": round(stop_loss_pct, 2),
             "综合评分": round(score, 2), "排序权重": round(priority, 2),
             "评分理由": " ".join(reasons), "微操建议": advice_60m,
-            "60分数据": df_60m_data, "日线数据": recent_day, "主力信号": force_signal
+            "60分数据": df_60m_data, "日线数据": recent_day, "主力信号": force_signal,
+            "换手率": turnover, "涨跌幅": current_pct
         }
     except: return None
 
@@ -203,9 +194,8 @@ def analyze_stock_task(args):
 
 def diagnose_single_stock(code, market_factor, sector_map):
     try:
-        # 🔥 直接使用云端缓存，无需再次联网
         spot = fetch_market_spot_data()
-        if spot.empty: return None, "行情数据获取失败"
+        if spot.empty: return None, "行情数据未就绪"
         
         row = spot[spot['代码'] == code]
         if row.empty: return None, "代码不存在"
@@ -223,98 +213,117 @@ def draw_mini_chart(df):
         x=mini_data['时间'], open=mini_data['开盘'], high=mini_data['最高'], low=mini_data['最低'], close=mini_data['收盘'],
         increasing_line_color='#ef5350', decreasing_line_color='#26a69a'
     ))
-    fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=80, xaxis=dict(visible=False), yaxis=dict(visible=False), showlegend=False)
+    fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=60, xaxis=dict(visible=False), yaxis=dict(visible=False), showlegend=False)
     return fig
 
 def draw_detail_chart(df, name):
     if df is None: return go.Figure()
+    
     df['MA5'] = df['收盘'].rolling(5).mean()
     df['MA20'] = df['收盘'].rolling(20).mean()
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df['日期'], open=df['开盘'], high=df['最高'], low=df['最低'], close=df['收盘'], name='K线', increasing_line_color='#ef5350', decreasing_line_color='#26a69a'))
-    fig.add_trace(go.Scatter(x=df['日期'], y=df['MA5'], line=dict(color='orange', width=1), name='MA5'))
-    fig.add_trace(go.Scatter(x=df['日期'], y=df['MA20'], line=dict(color='blue', width=1), name='MA20'))
-    fig.update_layout(title=f"{name} 日线趋势", height=350, xaxis_rangeslider_visible=False, yaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'))
+    
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+    
+    fig.add_trace(go.Candlestick(
+        x=df['日期'], open=df['开盘'], high=df['最高'], low=df['最低'], close=df['收盘'], 
+        name='K线', increasing_line_color='#ef5350', decreasing_line_color='#26a69a'
+    ), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(x=df['日期'], y=df['MA5'], line=dict(color='orange', width=1), name='MA5'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['日期'], y=df['MA20'], line=dict(color='blue', width=1), name='MA20'), row=1, col=1)
+    
+    colors = ['#ef5350' if r['收盘'] >= r['开盘'] else '#26a69a' for _, r in df.iterrows()]
+    fig.add_trace(go.Bar(x=df['日期'], y=df['成交量'], marker_color=colors, name='成交量'), row=2, col=1)
+    
+    fig.update_layout(
+        title=f"{name} 量价趋势", height=400, xaxis_rangeslider_visible=False, 
+        yaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
+        margin=dict(l=10, r=10, t=40, b=10)
+    )
     return fig
 
 # --- 侧边栏 ---
 with st.sidebar:
-    st.header("💸 操盘手 V40 (云端版)")
+    st.header("💸 操盘手 V42")
     
-    # 🔥 极速刷新逻辑：直接调用缓存函数
     if st.button("🔄 刷新全市场行情", type="primary"):
         with st.spinner("同步云端数据中心..."):
-            # 1. 强制清除旧缓存（确保数据是最新的）
             fetch_market_spot_data.clear()
-            # 2. 重新加载并缓存
             df = fetch_market_spot_data()
             st.session_state.last_update_str = datetime.now().strftime('%H:%M:%S')
-        st.success(f"已同步 {len(df)} 只股票行情")
+        st.success(f"已同步 {len(df)} 只股票")
         time.sleep(0.5)
         st.rerun()
     
-    st.caption(f"数据时间: {st.session_state.last_update_str}")
-    st.info("💡 提示：点击上方按钮后，全站所有功能（扫描、自选、诊股）将在 60秒内 **0延迟** 共享这份数据。")
+    st.caption(f"数据快照: {st.session_state.last_update_str}")
 
     if st.session_state.watchlist:
-        st.markdown("---")
-        # 🔥 从缓存中提取自选股数据，速度极快
+        st.markdown("### 👀 重点关注")
         df_cache = fetch_market_spot_data()
         
         for code, info in st.session_state.watchlist.items():
             name = info['name']
             cost = info.get('cost', 0)
             
-            # 尝试从缓存获取最新价
             curr = cost
-            gain = 0.0
+            pct = 0.0
+            
             if not df_cache.empty:
                 row = df_cache[df_cache['代码'] == str(code)]
                 if not row.empty:
                     curr = float(row.iloc[0]['最新价'])
-                    
-            gain = (curr - cost) / cost * 100 if cost > 0 and curr > 0 else 0
-            color = "red" if gain > 0 else ("green" if gain < 0 else "gray")
+                    pct = float(row.iloc[0]['涨跌幅'])
             
-            c1, c2, c3 = st.columns([3, 2, 1])
-            c1.markdown(f"**{name}**\n<span style='font-size:12px;color:gray'>{code}</span>", unsafe_allow_html=True)
-            c2.markdown(f"<span style='color:{color};font-weight:bold'>{gain:+.2f}%</span>", unsafe_allow_html=True)
-            if c3.button("✕", key=f"del_{code}"):
-                del st.session_state.watchlist[code]
-                st.rerun()
-            st.markdown("---")
-    
-    page = st.radio("功能模式:", ["⚡ 极速实战扫描", "📊 个股深度诊疗", "📂 资产看板"])
+            signal_icon = ""
+            if pct > 5.0: signal_icon = "🔥"
+            elif pct > 3.0: signal_icon = "🚀"
+            elif pct < -3.0: signal_icon = "💚"
+            
+            with st.container():
+                c1, c2, c3 = st.columns([3.5, 2, 1])
+                c1.markdown(f"**{name}** {signal_icon}", unsafe_allow_html=True)
+                
+                color = "red" if pct > 0 else "green"
+                c2.markdown(f"<span style='color:{color};font-weight:bold'>{pct:+.2f}%</span>", unsafe_allow_html=True)
+                
+                if c3.button("✕", key=f"del_{code}"):
+                    del st.session_state.watchlist[code]
+                    st.rerun()
+            st.markdown("<hr style='margin:5px 0'>", unsafe_allow_html=True) 
+            
+    page = st.radio("模式选择:", ["⚡ 战术扫描", "📊 深度诊疗", "📂 资产看板"])
 
 # --- 主页面 ---
-if page == "⚡ 极速实战扫描":
+if page == "⚡ 战术扫描":
     col_env1, col_env2 = st.columns(2)
     with col_env1:
         market_status, market_factor = fetch_market_sentiment_cached()
-        st.success(f"🌞 {market_status}") if market_factor >= 1.0 else st.warning(f"🌩️ {market_status}")
+        # ✅ 修复 BUG：使用标准 if/else 避免乱码
+        if market_factor >= 1.0:
+            st.success(f"🌞 {market_status}")
+        else:
+            st.warning(f"🌩️ {market_status}")
     
     with col_env2:
-        sector_map = fetch_basic_info() # 读取缓存的板块数据
+        sector_map = fetch_basic_info()
         st.caption("板块数据已就绪")
 
     col1, col2 = st.columns([4, 1])
-    with col1: st.info("筛选：主板 + 主力 + **资金穿透** | 排序：Alpha + 妖股基因")
+    with col1: st.info("策略：主板 + 资金穿透 + 妖股基因")
     
-    if col2.button("🚀 立即扫描", type="primary"):
-        with st.spinner("🚀 正在调用云端算力..."):
+    if col2.button("🚀 扫描", type="primary"):
+        with st.spinner("正在全市场选股..."):
             try:
-                # 🔥 直接从缓存读取，不再下载
                 df_spot = fetch_market_spot_data()
                 if df_spot.empty:
-                    st.error("行情数据未加载，请先点击侧边栏的【刷新全市场行情】！")
+                    st.error("请先点击侧边栏【刷新全市场行情】")
                 else:
                     mask = (~df_spot['名称'].str.contains("ST") & ~df_spot['代码'].str.startswith(("688", "8", "4", "9")) & (df_spot['换手率'] > 3.0) & (df_spot['市盈率-动态'] < 80))
-                    candidates = df_spot[mask].sort_values(by='换手率', ascending=False).head(60) # Cloud资源有限，限制前60以防超时
+                    candidates = df_spot[mask].sort_values(by='换手率', ascending=False).head(60)
                     
                     tasks = [(r['代码'], r['名称'], r, market_factor, sector_map) for _, r in candidates.iterrows()]
                     results = []
                     
-                    # Streamlit Cloud 建议线程数不要过高，16-20 是安全区
                     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
                         futures = {executor.submit(analyze_stock_task, t): t for t in tasks}
                         for f in concurrent.futures.as_completed(futures):
@@ -323,44 +332,61 @@ if page == "⚡ 极速实战扫描":
                     
                     if results:
                         st.session_state.scan_results = pd.DataFrame(results).sort_values(by='排序权重', ascending=False)
-                        st.success(f"扫描完成：命中 {len(results)} 只标的")
+                        st.success(f"命中 {len(results)} 标的")
                     else:
-                        st.warning("无符合条件标的")
+                        st.warning("无标的")
             except Exception as e: st.error(f"Error: {e}")
 
+    # 🔥 全端自适应网格展示
     if st.session_state.scan_results is not None and not st.session_state.scan_results.empty:
         df_res = st.session_state.scan_results
-        for idx, row in df_res.iterrows():
-            with st.container():
-                c1, c2, c3, c4 = st.columns([1.8, 3, 3, 1.5])
-                c1.markdown(f"**{row['代码']} {row['名称']}**")
-                
-                sec_pct = row['板块涨幅']
-                flow = row['个股资金'] 
-                sec_bg = "#fed7d7" if sec_pct > 1.0 else ("#f0fff4" if sec_pct < -1.0 else "#edf2f7")
-                flow_color = "red" if flow > 0 else "green"
-                
-                c1.markdown(f"<span style='background:{sec_bg};padding:2px;font-size:12px'>🏭 {row['行业']} {sec_pct:+.2f}%</span> <span style='color:{flow_color};font-weight:bold'>{flow:+.2f}亿</span>", unsafe_allow_html=True)
-                c1.caption(f"评分: **{row['综合评分']:.0f}**")
-                
-                c2.markdown(f"<span style='font-size:13px;color:#555'>{row['评分理由']}</span>", unsafe_allow_html=True)
-                c2.markdown(f"💡 <span style='color:red'>{row['微操建议']}</span>", unsafe_allow_html=True)
-                
-                if row['60分数据'] is not None:
-                    c3.plotly_chart(draw_mini_chart(row['60分数据']), use_container_width=True, key=f"mini_{row['代码']}")
-                else: c3.caption("无数据")
+        
+        # 定义列数：电脑端 3 列，手机端自动变为 1 列
+        cols = st.columns(3)
+        
+        for i, (idx, row) in enumerate(df_res.iterrows()):
+            # 循环填充列
+            with cols[i % 3]:
+                with st.container(border=True):
+                    # 顶部：名称+涨幅
+                    top1, top2 = st.columns([2, 1])
+                    top1.markdown(f"#### {row['名称']}")
+                    pct_color = "red" if row['涨跌幅'] > 0 else "green"
+                    top2.markdown(f"<h4 style='color:{pct_color};text-align:right'>{row['涨跌幅']:+.2f}%</h4>", unsafe_allow_html=True)
+                    
+                    st.caption(f"代码: {row['代码']} | 行业: {row['行业']}")
+                    
+                    # 关键指标
+                    k1, k2 = st.columns(2)
+                    k1.metric("主力资金", f"{row['个股资金']:+.2f}亿")
+                    k2.metric("综合评分", f"{row['综合评分']:.0f}")
+                    
+                    # 建议与标签
+                    st.markdown(f"**建议:** <span style='color:red'>{row['微操建议']}</span>", unsafe_allow_html=True)
+                    
+                    tags = row['评分理由'].split(" ")
+                    tag_html = ""
+                    for t in tags[:4]: # 最多显示4个标签，防止撑破卡片
+                        color = "#c53030" if "主力" in t else "#4a5568"
+                        bg = "#fff5f5" if "主力" in t else "#edf2f7"
+                        tag_html += f"<span style='color:{color};background:{bg};padding:1px 4px;border-radius:4px;font-size:11px;margin-right:3px;display:inline-block;margin-top:2px'>{t}</span>"
+                    st.markdown(tag_html, unsafe_allow_html=True)
+                    
+                    # 迷你图
+                    if row['60分数据'] is not None:
+                        st.plotly_chart(draw_mini_chart(row['60分数据']), use_container_width=True, key=f"mini_{row['代码']}")
+                    
+                    # 按钮
+                    if row['代码'] not in st.session_state.watchlist:
+                        if st.button("➕ 关注", key=f"add_{row['代码']}", use_container_width=True):
+                            st.session_state.watchlist[row['代码']] = {
+                                'name': row['名称'], 'cost': row['现价'], 'add_time': datetime.now().strftime('%m-%d')
+                            }
+                            st.rerun()
+                    else:
+                        st.button("✅ 已关注", disabled=True, key=f"added_{row['代码']}", use_container_width=True)
 
-                if row['代码'] in st.session_state.watchlist:
-                    c4.button("已加", disabled=True, key=f"s_{row['代码']}")
-                else:
-                    if c4.button("➕", key=f"s_add_{row['代码']}"):
-                        st.session_state.watchlist[row['代码']] = {
-                            'name': row['名称'], 'cost': row['现价'], 'add_time': datetime.now().strftime('%m-%d')
-                        }
-                        st.rerun()
-                st.markdown("---")
-
-elif page == "📊 个股深度诊疗":
+elif page == "📊 深度诊疗":
     st.title("🏥 个股诊疗")
     market_status, market_factor = fetch_market_sentiment_cached()
     sector_map = fetch_basic_info()
@@ -390,13 +416,13 @@ elif page == "📊 个股深度诊疗":
 
 elif page == "📂 资产看板":
     st.title("📂 资产看板")
-    st.caption(f"数据快照: {st.session_state.last_update_str} (点侧边栏刷新更新)")
+    st.caption(f"数据快照: {st.session_state.last_update_str}")
     
     if not st.session_state.watchlist:
         st.info("暂无自选股")
     else:
-        df_cache = fetch_market_spot_data() # 读取缓存
-        data = []
+        df_cache = fetch_market_spot_data()
+        
         for code, info in st.session_state.watchlist.items():
             curr = info.get('cost', 0)
             daily_pct = 0.0
@@ -410,9 +436,12 @@ elif page == "📂 资产看板":
             cost = info.get('cost', 0)
             total_gain = (curr - cost) / cost * 100 if cost > 0 else 0
             
-            data.append({
-                "代码": code, "名称": info['name'],
-                "现价": curr, "涨跌%": daily_pct, "盈亏%": total_gain
-            })
-        
-        st.dataframe(pd.DataFrame(data), hide_index=True, use_container_width=True)
+            with st.container(border=True):
+                c1, c2 = st.columns([2, 1])
+                c1.markdown(f"### {info['name']} <span style='font-size:12px;color:gray'>{code}</span>", unsafe_allow_html=True)
+                
+                pct_color = "red" if daily_pct > 0 else "green"
+                c2.markdown(f"<h3 style='color:{pct_color};text-align:right'>{daily_pct:+.2f}%</h3>", unsafe_allow_html=True)
+                
+                st.markdown(f"**现价:** ¥{curr} &nbsp;&nbsp; **成本:** ¥{cost}")
+                st.progress(min(100, max(0, int(50 + total_gain))), text=f"累计盈亏: {total_gain:+.2f}%")
