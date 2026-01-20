@@ -6,15 +6,16 @@ import time
 import json
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
+from datetime import datetime, timedelta
 import concurrent.futures
 from github import Github, GithubException
 
 # ================= 1. 系统配置 =================
-st.set_page_config(page_title="A股操盘手 V51", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="A股操盘手 V53", layout="wide", page_icon="♾️")
 
 # --- 核心：GitHub 云端持久化层 ---
-DATA_FILE = "sentinel_userdata.json"
+USER_DATA_FILE = "sentinel_userdata.json"
+MARKET_DATA_FILE = "market_snapshot.json"
 
 def get_github_repo():
     try:
@@ -25,22 +26,18 @@ def get_github_repo():
     except Exception as e:
         return None
 
+# --- 用户配置读写 (不变) ---
 def load_userdata():
-    if 'data_loaded' in st.session_state and st.session_state.data_loaded:
-        return {
-            "watchlist": st.session_state.watchlist,
-            "portfolio": st.session_state.strategy_portfolio
-        }
+    if 'user_data_loaded' in st.session_state:
+        return {"watchlist": st.session_state.watchlist, "portfolio": st.session_state.strategy_portfolio}
     repo = get_github_repo()
     if not repo: return {"watchlist": {}, "portfolio": {}}
     try:
-        contents = repo.get_contents(DATA_FILE)
-        data_str = contents.decoded_content.decode("utf-8")
-        data = json.loads(data_str)
-        st.session_state.data_loaded = True
+        contents = repo.get_contents(USER_DATA_FILE)
+        data = json.loads(contents.decoded_content.decode("utf-8"))
+        st.session_state.user_data_loaded = True
         return data
-    except Exception:
-        return {"watchlist": {}, "portfolio": {}}
+    except Exception: return {"watchlist": {}, "portfolio": {}}
 
 def save_userdata():
     repo = get_github_repo()
@@ -52,27 +49,97 @@ def save_userdata():
     }
     json_str = json.dumps(data, ensure_ascii=False, indent=4)
     try:
-        contents = repo.get_contents(DATA_FILE)
-        repo.update_file(path=DATA_FILE, message="[Auto] Update", content=json_str, sha=contents.sha)
+        contents = repo.get_contents(USER_DATA_FILE)
+        repo.update_file(path=USER_DATA_FILE, message="[Auto] User Data", content=json_str, sha=contents.sha)
     except Exception:
-        try:
-            repo.create_file(path=DATA_FILE, message="[Auto] Init", content=json_str)
-        except Exception: pass
+        try: repo.create_file(path=USER_DATA_FILE, message="[Init] User Data", content=json_str)
+        except: pass
 
-# 初始化
-with st.spinner("☁️ 连接云端数据库..."):
+# --- 🔥 V53: 强制全时段云备份 ---
+def save_market_snapshot(df):
+    """
+    无论何时调用，都会强制将当前 DataFrame 上传到 GitHub。
+    """
+    repo = get_github_repo()
+    if not repo: return
+    
+    # 获取当前时间 (北京时间估算: UTC+8)
+    # Streamlit Cloud 是 UTC 时间，所以加 8 小时
+    utc_now = datetime.utcnow()
+    bj_now = utc_now + timedelta(hours=8)
+    time_str = bj_now.strftime('%Y-%m-%d %H:%M:%S')
+    
+    snapshot_data = {
+        "timestamp": time_str,
+        "count": len(df),
+        "data": df.to_dict(orient='records')
+    }
+    # 压缩 JSON 以加快上传速度
+    json_str = json.dumps(snapshot_data, ensure_ascii=False, separators=(',', ':'))
+    
+    try:
+        try:
+            contents = repo.get_contents(MARKET_DATA_FILE)
+            repo.update_file(path=MARKET_DATA_FILE, message=f"[Snapshot] {time_str}", content=json_str, sha=contents.sha)
+        except Exception:
+            repo.create_file(path=MARKET_DATA_FILE, message=f"[Init] {time_str}", content=json_str)
+        st.toast(f"✅ 云端备份成功！时间戳: {time_str}")
+        return time_str
+    except Exception as e:
+        st.error(f"云备份失败: {e}")
+        return time_str
+
+def load_market_snapshot():
+    """启动时从 GitHub 拉取数据"""
+    repo = get_github_repo()
+    if not repo: return pd.DataFrame(), "未连接"
+    
+    try:
+        contents = repo.get_contents(MARKET_DATA_FILE)
+        data_packet = json.loads(contents.decoded_content.decode("utf-8"))
+        
+        df = pd.DataFrame(data_packet['data'])
+        if '代码' in df.columns:
+            df['代码'] = df['代码'].astype(str)
+            
+        return df, data_packet.get('timestamp', '未知时间')
+    except Exception:
+        return pd.DataFrame(), "无云端存档"
+
+# ================= 初始化逻辑 (启动即恢复) =================
+
+# 1. 加载用户数据
+with st.spinner("☁️ 正在同步账户数据..."):
     user_data = load_userdata()
 
 if 'watchlist' not in st.session_state: st.session_state.watchlist = user_data.get("watchlist", {})
 if 'strategy_portfolio' not in st.session_state: st.session_state.strategy_portfolio = user_data.get("portfolio", {})
+
+# 2. 🔥 V53 核心：自动恢复行情现场
+if 'market_snapshot' not in st.session_state:
+    st.session_state.market_snapshot = pd.DataFrame()
+    st.session_state.last_update_str = "等待加载..."
+    st.session_state.data_source = "未知"
+    
+    # 尝试从云端拉取
+    with st.spinner("📥 正在从云端恢复上次的行情现场..."):
+        df_snap, snap_time = load_market_snapshot()
+        if not df_snap.empty:
+            st.session_state.market_snapshot = df_snap
+            st.session_state.last_update_str = snap_time
+            st.session_state.data_source = "☁️ 云端存档"
+            # 只有第一次加载时提示，避免烦人
+            st.toast(f"已恢复 {snap_time} 的行情数据，无需重新下载！")
+        else:
+            st.session_state.last_update_str = "无存档，请刷新"
+
+# 其他状态
 if 'scan_results' not in st.session_state: st.session_state.scan_results = None
 if 'diagnosis_result' not in st.session_state: st.session_state.diagnosis_result = None
-if 'last_update_str' not in st.session_state: st.session_state.last_update_str = "未刷新"
 if 'page_idx_attack' not in st.session_state: st.session_state.page_idx_attack = 0
 if 'page_idx_ambush' not in st.session_state: st.session_state.page_idx_ambush = 0
-if 'market_snapshot' not in st.session_state: st.session_state.market_snapshot = pd.DataFrame()
 
-# ================= 2. 数据获取层 =================
+# ================= 2. 数据获取层 (API) =================
 
 @st.cache_data(ttl=3600*4) 
 def fetch_basic_info():
@@ -100,8 +167,8 @@ def fetch_market_sentiment_cached():
         else: return "🌧️ 大盘空头 (轻仓)", 0.8
     except: return "未知环境", 1.0
 
-# ================= 3. 核心算法 (保留不变) =================
-# ... (为节省篇幅，省略部分基础算法代码，逻辑与之前完全一致) ...
+# ================= 3. 核心算法 =================
+# ... (标准算法库，保持 V51 一致) ...
 def calculate_atr(df, period=14):
     high_low = df['最高'] - df['最低']; high_close = np.abs(df['最高'] - df['收盘'].shift()); low_close = np.abs(df['最低'] - df['收盘'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1); true_range = np.max(ranges, axis=1)
@@ -204,7 +271,7 @@ def diagnose_single_stock(code, market_factor, sector_map):
         return res, None
     except Exception as e: return None, str(e)
 
-# ================= 5. 绘图与 UI 组件 =================
+# ================= 5. 绘图与 UI =================
 
 def draw_mini_chart_compact(df):
     if df is None: return go.Figure()
@@ -225,42 +292,18 @@ def draw_detail_chart(df, name):
     fig.update_layout(title=f"{name} 量价趋势", height=400, xaxis_rangeslider_visible=False, yaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'), margin=dict(l=10, r=10, t=40, b=10))
     return fig
 
-# --- 🔥 新增：板块胶囊渲染器 ---
 def render_sector_pills(df_sec):
     if df_sec.empty: return
     df_sec = df_sec.sort_values(by='涨跌幅', ascending=False)
-    top5 = df_sec.head(6)
-    bot5 = df_sec.tail(6).sort_values(by='涨跌幅', ascending=True)
-    
-    # CSS 样式定义
-    st.markdown("""
-    <style>
-    .sector-container { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
-    .sector-badge { padding: 4px 10px; border-radius: 15px; font-size: 13px; font-weight: 600; white-space: nowrap; }
-    .badge-up { background-color: #ffebee; color: #c62828; border: 1px solid #ffcdd2; }
-    .badge-down { background-color: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9; }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    # 渲染领涨
-    html_up = '<div class="sector-container"><span style="align-self:center;font-weight:bold;color:#d32f2f">🚀 领涨:</span>'
-    for _, r in top5.iterrows():
-        html_up += f'<span class="sector-badge badge-up">{r["板块名称"]} {r["涨跌幅"]:.2f}%</span>'
-    html_up += '</div>'
+    top5 = df_sec.head(6); bot5 = df_sec.tail(6).sort_values(by='涨跌幅', ascending=True)
+    st.markdown("""<style>.sector-container { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; } .sector-badge { padding: 4px 10px; border-radius: 15px; font-size: 13px; font-weight: 600; white-space: nowrap; } .badge-up { background-color: #ffebee; color: #c62828; border: 1px solid #ffcdd2; } .badge-down { background-color: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9; }</style>""", unsafe_allow_html=True)
+    html_up = '<div class="sector-container"><span style="align-self:center;font-weight:bold;color:#d32f2f">🚀 领涨:</span>' + ''.join([f'<span class="sector-badge badge-up">{r["板块名称"]} {r["涨跌幅"]:.2f}%</span>' for _, r in top5.iterrows()]) + '</div>'
     st.markdown(html_up, unsafe_allow_html=True)
-    
-    # 渲染领跌
-    html_down = '<div class="sector-container"><span style="align-self:center;font-weight:bold;color:#388e3c">💚 领跌:</span>'
-    for _, r in bot5.iterrows():
-        html_down += f'<span class="sector-badge badge-down">{r["板块名称"]} {r["涨跌幅"]:.2f}%</span>'
-    html_down += '</div>'
+    html_down = '<div class="sector-container"><span style="align-self:center;font-weight:bold;color:#388e3c">💚 领跌:</span>' + ''.join([f'<span class="sector-badge badge-down">{r["板块名称"]} {r["涨跌幅"]:.2f}%</span>' for _, r in bot5.iterrows()]) + '</div>'
     st.markdown(html_down, unsafe_allow_html=True)
 
-# 列表渲染器
 def render_stock_list(df_subset, page_state_key):
-    if df_subset.empty:
-        st.info("暂无符合该分类的标的")
-        return
+    if df_subset.empty: st.info("暂无符合该分类的标的"); return
     items_per_page = 10; total_items = len(df_subset); total_pages = max(1, (total_items - 1) // items_per_page + 1)
     current_page = st.session_state[page_state_key]
     if current_page >= total_pages: current_page = total_pages - 1
@@ -269,19 +312,11 @@ def render_stock_list(df_subset, page_state_key):
     start_idx = current_page * items_per_page; end_idx = min(start_idx + items_per_page, total_items)
     page_data = df_subset.iloc[start_idx:end_idx]
     st.caption(f"第 {current_page+1}/{total_pages} 页 | 共 {total_items} 只")
-    
     for idx, row in page_data.iterrows():
         with st.container(border=True):
             c1, c2, c3, c4, c5 = st.columns([1.5, 1.5, 2.5, 2, 1])
-            with c1:
-                st.markdown(f"**{row['名称']}**"); st.caption(f"{row['代码']}")
-                sec_color = "red" if row['板块涨幅'] > 0 else "green"
-                st.markdown(f"<span style='font-size:12px;color:gray'>{row['行业']} <span style='color:{sec_color}'>{row['板块涨幅']:+.1f}%</span></span>", unsafe_allow_html=True)
-            with c2:
-                pct_color = "red" if row['涨跌幅'] > 0 else "green"
-                st.markdown(f"<span style='font-size:16px;font-weight:bold;color:{pct_color}'>{row['涨跌幅']:+.2f}%</span>", unsafe_allow_html=True)
-                flow_color = "#c53030" if row['个股资金'] > 0 else "#2f855a"
-                st.markdown(f"<span style='font-size:12px;color:{flow_color};font-weight:bold'>主力 {row['个股资金']:+.2f}亿</span>", unsafe_allow_html=True)
+            with c1: st.markdown(f"**{row['名称']}**"); st.caption(f"{row['代码']}"); sec_color = "red" if row['板块涨幅'] > 0 else "green"; st.markdown(f"<span style='font-size:12px;color:gray'>{row['行业']} <span style='color:{sec_color}'>{row['板块涨幅']:+.1f}%</span></span>", unsafe_allow_html=True)
+            with c2: pct_color = "red" if row['涨跌幅'] > 0 else "green"; st.markdown(f"<span style='font-size:16px;font-weight:bold;color:{pct_color}'>{row['涨跌幅']:+.2f}%</span>", unsafe_allow_html=True); flow_color = "#c53030" if row['个股资金'] > 0 else "#2f855a"; st.markdown(f"<span style='font-size:12px;color:{flow_color};font-weight:bold'>主力 {row['个股资金']:+.2f}亿</span>", unsafe_allow_html=True)
             with c3:
                 kelly_val = row['凯利仓位']; kelly_color = "#9c27b0" if kelly_val > 20 else ("#1976d2" if kelly_val > 10 else "#607d8b")
                 st.markdown(f"<span style='background:#f3e5f5;color:{kelly_color};padding:2px 5px;border-radius:4px;font-weight:bold;font-size:12px'>🎲 凯利: {kelly_val}%</span>", unsafe_allow_html=True)
@@ -291,8 +326,7 @@ def render_stock_list(df_subset, page_state_key):
             with c5:
                 if row['代码'] not in st.session_state.watchlist:
                     if st.button("➕", key=f"add_{row['代码']}_{page_state_key}"):
-                        st.session_state.watchlist[row['代码']] = {'name': row['名称'], 'cost': row['现价'], 'buy_time': datetime.now().strftime('%Y-%m-%d %H:%M'), 'highest': row['现价']}
-                        save_userdata(); st.rerun()
+                        st.session_state.watchlist[row['代码']] = {'name': row['名称'], 'cost': row['现价'], 'buy_time': datetime.now().strftime('%Y-%m-%d %H:%M'), 'highest': row['现价']}; save_userdata(); st.rerun()
                 else: st.button("✔", disabled=True, key=f"done_{row['代码']}_{page_state_key}")
     c1, c2, c3 = st.columns([1, 2, 1])
     with c1: 
@@ -302,12 +336,28 @@ def render_stock_list(df_subset, page_state_key):
 
 # --- 侧边栏 ---
 with st.sidebar:
-    st.header("💸 操盘手 V51")
-    if st.button("🔄 刷新全市场", type="primary"):
-        with st.spinner("同步云端..."):
-            df = download_market_spot_data(); st.session_state.market_snapshot = df; st.session_state.last_update_str = datetime.now().strftime('%H:%M:%S')
-        st.success(f"已缓存 {len(df)} 只标的"); time.sleep(0.5); st.rerun()
-    st.caption(f"快照: {st.session_state.last_update_str}")
+    st.header("💸 操盘手 V53")
+    
+    # 🔥 V53 修改：刷新 = 下载 + 内存更新 + 强制云端备份
+    if st.button("🔄 刷新全市场 (并备份)", type="primary"):
+        with st.spinner("📥 1. 下载全市场数据..."):
+            df = download_market_spot_data()
+        
+        with st.spinner("☁️ 2. 上传至云端数据库..."):
+            saved_time = save_market_snapshot(df)
+            st.session_state.market_snapshot = df
+            st.session_state.last_update_str = saved_time
+            st.session_state.data_source = "🔴 实时 (已备份)"
+            
+        st.success(f"完成！已更新 {len(df)} 只标的")
+        time.sleep(0.5)
+        st.rerun()
+    
+    # 数据源状态显示
+    source_color = "red" if "实时" in st.session_state.get('data_source', '') else "blue"
+    st.markdown(f"**数据源:** <span style='color:{source_color}'>{st.session_state.get('data_source', '未加载')}</span>", unsafe_allow_html=True)
+    st.caption(f"数据时间: {st.session_state.last_update_str}")
+    
     if st.session_state.watchlist:
         st.markdown("### 👀 重点关注")
         df_cache = st.session_state.market_snapshot
@@ -324,31 +374,29 @@ with st.sidebar:
                 c2.markdown(f"<span style='color:{color};font-weight:bold'>{pct:+.2f}%</span>", unsafe_allow_html=True)
                 if c3.button("✕", key=f"del_{code}"): del st.session_state.watchlist[code]; save_userdata(); st.rerun()
             st.markdown("<hr style='margin:5px 0'>", unsafe_allow_html=True)
-            
+
     page = st.radio("模式选择:", ["⚡ 战术扫描", "🤖 策略组合", "📊 深度诊疗", "📂 资产看板"])
 
 # --- 主页面 ---
 if page == "⚡ 战术扫描":
-    # 🔥 V51: 紧凑型大盘与板块展示
     col_env1, col_env2 = st.columns([1, 3])
     with col_env1:
         market_status, market_factor = fetch_market_sentiment_cached()
-        bg_color = "#e8f5e9" if market_factor >= 1.0 else "#ffebee"
-        text_color = "#2e7d32" if market_factor >= 1.0 else "#c62828"
+        bg_color = "#e8f5e9" if market_factor >= 1.0 else "#ffebee"; text_color = "#2e7d32" if market_factor >= 1.0 else "#c62828"
         st.markdown(f"""<div style="background:{bg_color};padding:10px;border-radius:8px;text-align:center;color:{text_color};font-weight:bold;margin-bottom:10px">{market_status}</div>""", unsafe_allow_html=True)
-        
     with col_env2:
-        df_sec, sector_map = fetch_basic_info()
-        render_sector_pills(df_sec) # 调用胶囊渲染器
+        df_sec, sector_map = fetch_basic_info(); render_sector_pills(df_sec)
 
     st.markdown("---")
     col1, col2 = st.columns([4, 1])
     with col1: st.info("策略：资金穿透 + 妖股基因 + **凯利风控**")
+    
+    # 扫描按钮
     if col2.button("🚀 扫描", type="primary"):
         st.session_state.page_idx_attack = 0; st.session_state.page_idx_ambush = 0
-        with st.spinner("全市场扫描中..."):
+        with st.spinner(f"正在分析 {len(st.session_state.market_snapshot)} 只股票..."):
             try:
-                if st.session_state.market_snapshot.empty: st.error("请先点击侧边栏【刷新全市场】")
+                if st.session_state.market_snapshot.empty: st.error("数据为空，请点击侧边栏刷新")
                 else:
                     df_spot = st.session_state.market_snapshot
                     mask = (~df_spot['名称'].str.contains("ST") & ~df_spot['代码'].str.startswith(("688", "8", "4", "9")) & (df_spot['换手率'] > 3.0) & (df_spot['市盈率-动态'] < 80))
@@ -372,7 +420,7 @@ if page == "⚡ 战术扫描":
         with tab1: render_stock_list(df_attack, "page_idx_attack")
         with tab2: render_stock_list(df_ambush, "page_idx_ambush")
 
-# (以下部分页面代码逻辑保持 V50 不变，仅为节省篇幅略去，请直接使用 V50 的对应部分或相信我已整合好)
+# (以下页面逻辑保持一致，略)
 elif page == "🤖 策略组合":
     st.title("🤖 策略组合 (实盘模拟)")
     st.caption("数据已开启硬盘级永久保存。")
