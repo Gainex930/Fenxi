@@ -9,7 +9,7 @@ from datetime import datetime
 import concurrent.futures
 
 # ================= 1. 系统配置 =================
-st.set_page_config(page_title="A股操盘手 V45", layout="wide", page_icon="💾")
+st.set_page_config(page_title="A股操盘手 V46", layout="wide", page_icon="🔥")
 
 # 初始化状态
 if 'watchlist' not in st.session_state: st.session_state.watchlist = {}
@@ -18,28 +18,26 @@ if 'diagnosis_result' not in st.session_state: st.session_state.diagnosis_result
 if 'last_update_str' not in st.session_state: st.session_state.last_update_str = "未刷新"
 if 'page_idx_attack' not in st.session_state: st.session_state.page_idx_attack = 0
 if 'page_idx_ambush' not in st.session_state: st.session_state.page_idx_ambush = 0
-
-# 🔥 V45 核心：全市场数据持久化存储
 if 'market_snapshot' not in st.session_state: st.session_state.market_snapshot = pd.DataFrame()
 
-# 数据迁移兼容
+# 数据迁移
 try:
     for code, val in st.session_state.watchlist.items():
         if isinstance(val, str): 
             st.session_state.watchlist[code] = {'name': val, 'cost': 0.0, 'add_time': datetime.now().strftime('%m-%d')}
 except: pass
 
-# ================= 2. 数据获取层 (API) =================
+# ================= 2. 数据获取层 =================
 
 @st.cache_data(ttl=3600*4) 
 def fetch_basic_info():
     try:
         df_sector = ak.stock_board_industry_name_em()
+        # 返回原生 DataFrame 方便排序，同时返回字典方便查询
         sector_map = dict(zip(df_sector['板块名称'], df_sector['涨跌幅']))
-        return sector_map
-    except: return {}
+        return df_sector, sector_map
+    except: return pd.DataFrame(), {}
 
-# 这个函数只负责单纯的下载，不负责存储逻辑
 def download_market_spot_data():
     try:
         df = ak.stock_zh_a_spot_em()
@@ -97,12 +95,10 @@ def get_stock_industry(code):
 
 def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None, strict_mode=True):
     try:
-        # 直接从 spot_row (来自内存) 获取基础数据，无需请求
         current_price = spot_row['最新价']
         current_pct = spot_row['涨跌幅']
         pe, turnover = spot_row['市盈率-动态'], spot_row['换手率']
         
-        # 必须请求 K 线数据 (这是不可避免的，但单只股票很快)
         df_day = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
         if df_day.empty or len(df_day) < 60: return None
         
@@ -201,7 +197,6 @@ def analyze_stock_task(args):
 
 def diagnose_single_stock(code, market_factor, sector_map):
     try:
-        # 🔥 V45 核心修改：优先从 session_state 读取，不联网！
         if 'market_snapshot' in st.session_state and not st.session_state.market_snapshot.empty:
             spot = st.session_state.market_snapshot
         else:
@@ -210,7 +205,6 @@ def diagnose_single_stock(code, market_factor, sector_map):
         row = spot[spot['代码'] == code]
         if row.empty: return None, "代码不存在或不在主板列表"
         
-        # 传递 row 给分析核心，核心会直接用 row 里的价格数据
         res = analyze_stock_core(code, row.iloc[0]['名称'], row.iloc[0], market_factor, sector_map, strict_mode=False)
         return res, None
     except Exception as e: return None, str(e)
@@ -244,7 +238,6 @@ def draw_detail_chart(df, name):
     fig.update_layout(title=f"{name} 量价趋势", height=400, xaxis_rangeslider_visible=False, yaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'), margin=dict(l=10, r=10, t=40, b=10))
     return fig
 
-# --- 封装列表渲染函数 ---
 def render_stock_list(df_subset, page_state_key):
     if df_subset.empty:
         st.info("暂无符合该分类的标的")
@@ -313,13 +306,12 @@ def render_stock_list(df_subset, page_state_key):
 
 # --- 侧边栏 ---
 with st.sidebar:
-    st.header("💸 操盘手 V45")
+    st.header("💸 操盘手 V46")
     
-    # 🔥 V45 修改：刷新按钮负责下载并持久化存储
     if st.button("🔄 刷新全市场", type="primary"):
         with st.spinner("同步云端..."):
             df = download_market_spot_data()
-            st.session_state.market_snapshot = df # 存入 session_state
+            st.session_state.market_snapshot = df 
             st.session_state.last_update_str = datetime.now().strftime('%H:%M:%S')
         st.success(f"已缓存 {len(df)} 只标的")
         time.sleep(0.5)
@@ -329,7 +321,6 @@ with st.sidebar:
 
     if st.session_state.watchlist:
         st.markdown("### 👀 重点关注")
-        # 直接读取 Session 中的缓存
         df_cache = st.session_state.market_snapshot
         
         for code, info in st.session_state.watchlist.items():
@@ -359,15 +350,35 @@ with st.sidebar:
 
 # --- 主页面 ---
 if page == "⚡ 战术扫描":
-    col_env1, col_env2 = st.columns(2)
+    # 顶部：大盘与板块状态
+    col_env1, col_env2 = st.columns([1, 2])
     with col_env1:
         market_status, market_factor = fetch_market_sentiment_cached()
         if market_factor >= 1.0: st.success(f"🌞 {market_status}")
         else: st.warning(f"🌩️ {market_status}")
+        
     with col_env2:
-        sector_map = fetch_basic_info()
-        st.caption("板块数据已就绪")
+        df_sec, sector_map = fetch_basic_info()
+        # 🔥 V46 核心：板块热力展示
+        if not df_sec.empty:
+            df_sec = df_sec.sort_values(by='涨跌幅', ascending=False)
+            top5 = df_sec.head(5)
+            bot5 = df_sec.tail(5).sort_values(by='涨跌幅', ascending=True)
+            
+            with st.expander("🔥 市场主线 | 领涨 vs 领跌 (点击展开)", expanded=True):
+                s1, s2 = st.columns(2)
+                with s1:
+                    st.markdown("**🚀 领涨板块**")
+                    for _, r in top5.iterrows():
+                        st.markdown(f"<span style='color:red;font-weight:bold'>{r['板块名称']} {r['涨跌幅']:.2f}%</span>", unsafe_allow_html=True)
+                with s2:
+                    st.markdown("**💚 领跌板块**")
+                    for _, r in bot5.iterrows():
+                        st.markdown(f"<span style='color:green;font-weight:bold'>{r['板块名称']} {r['涨跌幅']:.2f}%</span>", unsafe_allow_html=True)
+        else:
+            st.caption("板块数据加载中...")
 
+    st.markdown("---")
     col1, col2 = st.columns([4, 1])
     with col1: st.info("策略：主板 + 资金穿透 + 妖股基因")
     
@@ -377,7 +388,6 @@ if page == "⚡ 战术扫描":
         
         with st.spinner("全市场扫描中..."):
             try:
-                # 🔥 V45 修改：优先使用缓存
                 if st.session_state.market_snapshot.empty:
                     st.error("请先点击侧边栏【刷新全市场】")
                 else:
@@ -407,14 +417,13 @@ if page == "⚡ 战术扫描":
         df_ambush = df_res[~mask_attack]
         
         tab1, tab2 = st.tabs([f"🔥 核心进攻 ({len(df_attack)})", f"🕵️ 潜伏埋伏 ({len(df_ambush)})"])
-        
         with tab1: render_stock_list(df_attack, "page_idx_attack")
         with tab2: render_stock_list(df_ambush, "page_idx_ambush")
 
 elif page == "📊 深度诊疗":
     st.title("🏥 个股诊疗")
     market_status, market_factor = fetch_market_sentiment_cached()
-    sector_map = fetch_basic_info()
+    _, sector_map = fetch_basic_info()
 
     c1, c2 = st.columns([3, 1])
     code_in = c1.text_input("输入代码", placeholder="6位代码")
