@@ -3,29 +3,102 @@ import akshare as ak
 import pandas as pd
 import numpy as np
 import time
+import json
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 import concurrent.futures
+from github import Github, GithubException # 🔥 引入 GitHub 库
 
 # ================= 1. 系统配置 =================
-st.set_page_config(page_title="A股操盘手 V47", layout="wide", page_icon="🎲")
+st.set_page_config(page_title="A股操盘手 V50", layout="wide", page_icon="☁️")
 
-# 初始化状态
-if 'watchlist' not in st.session_state: st.session_state.watchlist = {}
+# --- 🔥 V50 核心：GitHub 云端持久化层 ---
+DATA_FILE = "sentinel_userdata.json"
+
+def get_github_repo():
+    """连接到您的 GitHub 仓库"""
+    try:
+        token = st.secrets["GITHUB_TOKEN"]
+        repo_name = st.secrets["REPO_NAME"]
+        g = Github(token)
+        return g.get_repo(repo_name)
+    except Exception as e:
+        st.error(f"GitHub 配置错误: {e}")
+        return None
+
+def load_userdata():
+    """从 GitHub 仓库读取数据"""
+    # 优先尝试从 Session State 读取（避免频繁请求 API）
+    if 'data_loaded' in st.session_state and st.session_state.data_loaded:
+        return {
+            "watchlist": st.session_state.watchlist,
+            "portfolio": st.session_state.strategy_portfolio
+        }
+
+    repo = get_github_repo()
+    if not repo: return {"watchlist": {}, "portfolio": {}}
+    
+    try:
+        # 尝试获取文件内容
+        contents = repo.get_contents(DATA_FILE)
+        data_str = contents.decoded_content.decode("utf-8")
+        data = json.loads(data_str)
+        st.session_state.data_loaded = True # 标记已加载
+        return data
+    except Exception:
+        # 如果文件不存在，返回空
+        return {"watchlist": {}, "portfolio": {}}
+
+def save_userdata():
+    """将数据保存回 GitHub 仓库"""
+    repo = get_github_repo()
+    if not repo: return
+
+    data = {
+        "watchlist": st.session_state.watchlist,
+        "portfolio": st.session_state.strategy_portfolio,
+        "last_save": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
+    json_str = json.dumps(data, ensure_ascii=False, indent=4)
+    
+    try:
+        # 尝试获取文件（为了获取 sha 校验码，这是更新文件的必要条件）
+        contents = repo.get_contents(DATA_FILE)
+        repo.update_file(
+            path=DATA_FILE,
+            message="[Auto] Update user data via Streamlit",
+            content=json_str,
+            sha=contents.sha
+        )
+        st.toast("☁️ 数据已同步至 GitHub")
+    except Exception:
+        # 如果文件不存在，则创建新文件
+        try:
+            repo.create_file(
+                path=DATA_FILE,
+                message="[Auto] Init user data",
+                content=json_str
+            )
+            st.toast("☁️ 初始化云端存档成功")
+        except Exception as e:
+            st.error(f"保存失败: {e}")
+
+# 初始化状态 (从 GitHub 加载)
+with st.spinner("正在从云端拉取您的持仓记录..."):
+    user_data = load_userdata()
+
+if 'watchlist' not in st.session_state: 
+    st.session_state.watchlist = user_data.get("watchlist", {})
+if 'strategy_portfolio' not in st.session_state: 
+    st.session_state.strategy_portfolio = user_data.get("portfolio", {})
+
 if 'scan_results' not in st.session_state: st.session_state.scan_results = None
 if 'diagnosis_result' not in st.session_state: st.session_state.diagnosis_result = None
 if 'last_update_str' not in st.session_state: st.session_state.last_update_str = "未刷新"
 if 'page_idx_attack' not in st.session_state: st.session_state.page_idx_attack = 0
 if 'page_idx_ambush' not in st.session_state: st.session_state.page_idx_ambush = 0
 if 'market_snapshot' not in st.session_state: st.session_state.market_snapshot = pd.DataFrame()
-
-# 数据迁移
-try:
-    for code, val in st.session_state.watchlist.items():
-        if isinstance(val, str): 
-            st.session_state.watchlist[code] = {'name': val, 'cost': 0.0, 'add_time': datetime.now().strftime('%m-%d')}
-except: pass
 
 # ================= 2. 数据获取层 =================
 
@@ -55,7 +128,7 @@ def fetch_market_sentiment_cached():
         else: return "🌧️ 大盘空头 (轻仓)", 0.8
     except: return "未知环境", 1.0
 
-# ================= 3. 基础算法库 (含凯利公式) =================
+# ================= 3. 基础算法库 =================
 
 def calculate_atr(df, period=14):
     high_low = df['最高'] - df['最低']
@@ -74,40 +147,16 @@ def calculate_kdj(df, n=9, m1=3, m2=3):
     j = 3 * k - 2 * d
     return k, d, j
 
-# 🔥 新增：凯利公式计算器
 def calculate_kelly(score, win_loss_ratio=2.0):
-    """
-    根据评分估算胜率，进而计算凯利仓位。
-    Args:
-        score: 0-100 的技术评分
-        win_loss_ratio: 盈亏比 (默认为 2:1)
-    Returns:
-        suggested_position: 建议单一标的仓位百分比 (已应用半凯利安全系数)
-    """
-    # 1. 将评分映射为胜率 P (Probability)
-    # 假设：60分=50%胜率，100分=75%胜率 (线性映射)
-    # P = 0.5 + (score - 60) * (0.25 / 40)
-    if score < 60:
-        p = 0.4 # 不及格，胜率极低
-    else:
-        p = 0.5 + (score - 60) * 0.00625
-    
-    p = min(0.8, p) # 胜率封顶 80%，防止过度自信
-    
-    # 2. 凯利公式: f = (bp - q) / b
-    # b = win_loss_ratio
-    # q = 1 - p
+    if score < 60: p = 0.4
+    else: p = 0.5 + (score - 60) * 0.00625
+    p = min(0.8, p)
     b = win_loss_ratio
     q = 1 - p
     f = (b * p - q) / b
-    
-    # 3. 安全边际：半凯利 (Half-Kelly)
-    # 凯利公式非常激进，实战通常除以 2
     f_safe = f * 0.5
-    
-    # 4. 格式化输出
     if f_safe <= 0: return 0.0
-    return round(f_safe * 100, 1) # 返回百分比
+    return round(f_safe * 100, 1)
 
 def get_individual_fund_flow(code):
     try:
@@ -209,12 +258,8 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
         if is_high_risk: score -= 15; reasons.append("⚠️高位")
         if is_broken: score = min(score, 40); advice_60m="🛑 离场"
         
-        # 最终得分计算
         final_score = max(0.0, min(100.00, score * market_factor))
-        
-        # 🔥 计算凯利建议仓位
         kelly_pct = calculate_kelly(final_score, win_loss_ratio=2.0)
-        
         priority = final_score + (100 if has_gold_cross and not is_broken else 0) + (50 if alpha > 0 else 0) + (30 if individual_flow > 0.5 else 0)
         
         recent_day = df_day.tail(30).copy()
@@ -228,7 +273,7 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
             "评分理由": " ".join(reasons), "微操建议": advice_60m,
             "60分数据": df_60m_data, "日线数据": recent_day, "主力信号": force_signal,
             "换手率": turnover, "涨跌幅": current_pct,
-            "凯利仓位": kelly_pct  # 新增字段
+            "凯利仓位": kelly_pct
         }
     except: return None
 
@@ -313,11 +358,9 @@ def render_stock_list(df_subset, page_state_key):
                 flow_color = "#c53030" if row['个股资金'] > 0 else "#2f855a"
                 st.markdown(f"<span style='font-size:12px;color:{flow_color};font-weight:bold'>主力 {row['个股资金']:+.2f}亿</span>", unsafe_allow_html=True)
             with c3:
-                # 凯利仓位标签
                 kelly_val = row['凯利仓位']
                 kelly_color = "#9c27b0" if kelly_val > 20 else ("#1976d2" if kelly_val > 10 else "#607d8b")
                 st.markdown(f"<span style='background:#f3e5f5;color:{kelly_color};padding:2px 5px;border-radius:4px;font-weight:bold;font-size:12px'>🎲 凯利: {kelly_val}%</span>", unsafe_allow_html=True)
-                
                 st.markdown(f"<span style='font-size:13px'>建议: <span style='color:red;font-weight:bold'>{row['微操建议']}</span></span>", unsafe_allow_html=True)
                 st.caption(f"评分: {row['综合评分']:.0f}")
             with c4:
@@ -327,8 +370,12 @@ def render_stock_list(df_subset, page_state_key):
                 if row['代码'] not in st.session_state.watchlist:
                     if st.button("➕", key=f"add_{row['代码']}_{page_state_key}"):
                         st.session_state.watchlist[row['代码']] = {
-                            'name': row['名称'], 'cost': row['现价'], 'add_time': datetime.now().strftime('%m-%d')
+                            'name': row['名称'], 
+                            'cost': row['现价'], 
+                            'buy_time': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                            'highest': row['现价']
                         }
+                        save_userdata() # 🔥 立即同步到云端
                         st.rerun()
                 else:
                     st.button("✔", disabled=True, key=f"done_{row['代码']}_{page_state_key}")
@@ -345,7 +392,7 @@ def render_stock_list(df_subset, page_state_key):
 
 # --- 侧边栏 ---
 with st.sidebar:
-    st.header("💸 操盘手 V47")
+    st.header("💸 操盘手 V50")
     
     if st.button("🔄 刷新全市场", type="primary"):
         with st.spinner("同步云端..."):
@@ -382,14 +429,14 @@ with st.sidebar:
                 c2.markdown(f"<span style='color:{color};font-weight:bold'>{pct:+.2f}%</span>", unsafe_allow_html=True)
                 if c3.button("✕", key=f"del_{code}"):
                     del st.session_state.watchlist[code]
+                    save_userdata() # 🔥 删除后同步
                     st.rerun()
             st.markdown("<hr style='margin:5px 0'>", unsafe_allow_html=True) 
             
-    page = st.radio("模式选择:", ["⚡ 战术扫描", "📊 深度诊疗", "📂 资产看板"])
+    page = st.radio("模式选择:", ["⚡ 战术扫描", "🤖 策略组合", "📊 深度诊疗", "📂 资产看板"])
 
 # --- 主页面 ---
 if page == "⚡ 战术扫描":
-    # 顶部：大盘与板块状态
     col_env1, col_env2 = st.columns([1, 2])
     with col_env1:
         market_status, market_factor = fetch_market_sentiment_cached()
@@ -402,7 +449,6 @@ if page == "⚡ 战术扫描":
             df_sec = df_sec.sort_values(by='涨跌幅', ascending=False)
             top5 = df_sec.head(5)
             bot5 = df_sec.tail(5).sort_values(by='涨跌幅', ascending=True)
-            
             with st.expander("🔥 市场主线 | 领涨 vs 领跌 (点击展开)", expanded=True):
                 s1, s2 = st.columns(2)
                 with s1:
@@ -413,8 +459,7 @@ if page == "⚡ 战术扫描":
                     st.markdown("**💚 领跌板块**")
                     for _, r in bot5.iterrows():
                         st.markdown(f"<span style='color:green;font-weight:bold'>{r['板块名称']} {r['涨跌幅']:.2f}%</span>", unsafe_allow_html=True)
-        else:
-            st.caption("板块数据加载中...")
+        else: st.caption("板块数据加载中...")
 
     st.markdown("---")
     col1, col2 = st.columns([4, 1])
@@ -423,7 +468,6 @@ if page == "⚡ 战术扫描":
     if col2.button("🚀 扫描", type="primary"):
         st.session_state.page_idx_attack = 0
         st.session_state.page_idx_ambush = 0
-        
         with st.spinner("全市场扫描中..."):
             try:
                 if st.session_state.market_snapshot.empty:
@@ -453,10 +497,74 @@ if page == "⚡ 战术扫描":
         mask_attack = df_res['微操建议'].str.contains("起爆|点火|金叉")
         df_attack = df_res[mask_attack]
         df_ambush = df_res[~mask_attack]
-        
         tab1, tab2 = st.tabs([f"🔥 核心进攻 ({len(df_attack)})", f"🕵️ 潜伏埋伏 ({len(df_ambush)})"])
         with tab1: render_stock_list(df_attack, "page_idx_attack")
         with tab2: render_stock_list(df_ambush, "page_idx_ambush")
+
+elif page == "🤖 策略组合":
+    st.title("🤖 策略组合 (实盘模拟)")
+    st.caption("数据已开启硬盘级永久保存，重启页面不丢失。")
+    
+    c1, c2 = st.columns([3, 1])
+    with c1: st.info("AI 自动精选 Top 3 龙头股，并持续跟踪。")
+    
+    if c2.button("⚡ AI一键建仓", type="primary"):
+        if st.session_state.scan_results is None or st.session_state.scan_results.empty:
+            st.error("请先扫描！")
+        else:
+            top3 = st.session_state.scan_results.head(3)
+            st.session_state.strategy_portfolio = {}
+            for _, row in top3.iterrows():
+                st.session_state.strategy_portfolio[row['代码']] = {
+                    'name': row['名称'],
+                    'cost': row['现价'],
+                    'buy_time': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                    'highest': row['现价'],
+                    'kelly': row['凯利仓位']
+                }
+            save_userdata() # 🔥 立即同步到云端
+            st.success("✅ 建仓完成并存档！")
+            st.rerun()
+
+    portfolio = st.session_state.strategy_portfolio
+    if not portfolio:
+        st.warning("暂无持仓")
+    else:
+        df_cache = st.session_state.market_snapshot
+        
+        total_pnl = 0
+        win_count = 0
+        
+        for code, data in portfolio.items():
+            curr = data['cost']
+            if not df_cache.empty:
+                row = df_cache[df_cache['代码'] == str(code)]
+                if not row.empty: curr = float(row.iloc[0]['最新价'])
+            
+            if curr > data.get('highest', 0): 
+                portfolio[code]['highest'] = curr
+                save_userdata() 
+                
+            pnl = (curr - data['cost']) / data['cost'] * 100
+            high = data.get('highest', curr)
+            dd = (curr - high) / high * 100 if high > 0 else 0
+            
+            if pnl > 0: win_count += 1
+            total_pnl += pnl
+            
+            with st.container(border=True):
+                c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+                c1.markdown(f"**{data['name']}** ({code})")
+                c1.caption(f"📅 {data['buy_time']}")
+                
+                color = "red" if pnl > 0 else "green"
+                c2.markdown(f"收益: <span style='color:{color};font-size:18px;font-weight:bold'>{pnl:+.2f}%</span>", unsafe_allow_html=True)
+                c3.markdown(f"回撤: {dd:.2f}% | 凯利: {data.get('kelly', 0)}%")
+                
+                if c4.button("平仓", key=f"sell_ai_{code}"):
+                    del st.session_state.strategy_portfolio[code]
+                    save_userdata() # 🔥 删除后同步
+                    st.rerun()
 
 elif page == "📊 深度诊疗":
     st.title("🏥 个股诊疗")
@@ -475,8 +583,7 @@ elif page == "📊 深度诊疗":
         res = st.session_state.diagnosis_result
         k1, k2, k3 = st.columns(3)
         k1.metric("综合评分", f"{res['综合评分']:.0f}")
-        # 显示凯利仓位
-        k2.metric("建议仓位(Kelly)", f"{res['凯利仓位']}%")
+        k2.metric("建议仓位", f"{res['凯利仓位']}%")
         k3.metric("资金", f"{res['个股资金']:+.2f}亿")
         
         st.info(res['评分理由'])
@@ -484,35 +591,67 @@ elif page == "📊 深度诊疗":
         
         if res['代码'] not in st.session_state.watchlist:
             if st.button(f"➕ 加入自选 ({res['名称']})", use_container_width=True):
-                st.session_state.watchlist[res['代码']] = {'name': res['名称'], 'cost': res['现价'], 'add_time': datetime.now().strftime('%m-%d')}
+                st.session_state.watchlist[res['代码']] = {
+                    'name': res['名称'], 
+                    'cost': res['现价'], 
+                    'buy_time': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                    'highest': res['现价']
+                }
+                save_userdata() # 🔥 立即同步到云端
                 st.rerun()
 
 elif page == "📂 资产看板":
-    st.title("📂 资产看板")
-    if not st.session_state.watchlist:
-        st.info("暂无自选股")
+    st.title("📂 实盘账户分析 (全域回测)")
+    
+    all_holdings = []
+    for code, info in st.session_state.watchlist.items():
+        info['type'] = '手动'
+        info['code'] = code
+        all_holdings.append(info)
+    for code, info in st.session_state.strategy_portfolio.items():
+        info['type'] = 'AI'
+        info['code'] = code
+        all_holdings.append(info)
+        
+    if not all_holdings:
+        st.info("暂无持仓记录")
     else:
         df_cache = st.session_state.market_snapshot
         
-        for code, info in st.session_state.watchlist.items():
-            curr = info.get('cost', 0)
-            daily_pct = 0.0
+        for item in all_holdings:
+            code = item['code']
+            curr = item.get('cost', 0)
+            
             if not df_cache.empty:
                 row = df_cache[df_cache['代码'] == str(code)]
-                if not row.empty:
-                    curr = float(row.iloc[0]['最新价'])
-                    daily_pct = float(row.iloc[0]['涨跌幅'])
+                if not row.empty: curr = float(row.iloc[0]['最新价'])
             
-            cost = info.get('cost', 0)
-            total_gain = (curr - cost) / cost * 100 if cost > 0 else 0
+            highest = item.get('highest', item['cost'])
+            if curr > highest:
+                highest = curr
+                if item['type'] == '手动': st.session_state.watchlist[code]['highest'] = highest
+                else: st.session_state.strategy_portfolio[code]['highest'] = highest
+                save_userdata() # 更新回撤数据时保存
+                
+            pnl = (curr - item['cost']) / item['cost'] * 100
+            dd = (curr - highest) / highest * 100 if highest > 0 else 0
             
             with st.container(border=True):
-                c1, c2, c3 = st.columns([2, 1, 1])
-                c1.markdown(f"**{info['name']}** <span style='color:gray'>{code}</span>", unsafe_allow_html=True)
-                pct_color = "red" if daily_pct > 0 else "green"
-                c1.markdown(f"现价: {curr} (<span style='color:{pct_color}'>{daily_pct:+.2f}%</span>)", unsafe_allow_html=True)
+                c1, c2, c3, c4 = st.columns([1.5, 1.5, 2, 1])
+                tag_bg = "#e3f2fd" if item['type'] == 'AI' else "#fff3e0"
+                tag_color = "#1565c0" if item['type'] == 'AI' else "#e65100"
                 
-                c2.metric("累计盈亏", f"{total_gain:+.2f}%")
-                if c3.button("删除", key=f"rm_{code}"):
-                    del st.session_state.watchlist[code]
+                c1.markdown(f"**{item['name']}** <span style='background:{tag_bg};color:{tag_color};padding:2px 6px;border-radius:4px;font-size:12px'>{item['type']}</span>", unsafe_allow_html=True)
+                c1.caption(f"建仓: {item.get('buy_time', '--')}")
+                
+                pnl_color = "red" if pnl > 0 else "green"
+                c2.markdown(f"<span style='color:{pnl_color};font-size:18px;font-weight:bold'>{pnl:+.2f}%</span>", unsafe_allow_html=True)
+                c2.caption(f"成本: {item['cost']} -> 现价: {curr}")
+                
+                c3.metric("最大回撤", f"{dd:.2f}%")
+                
+                if c4.button("平仓/删", key=f"del_all_{code}_{item['type']}"):
+                    if item['type'] == '手动': del st.session_state.watchlist[code]
+                    else: del st.session_state.strategy_portfolio[code]
+                    save_userdata() # 🔥 删除后同步
                     st.rerun()
