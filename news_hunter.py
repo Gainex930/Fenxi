@@ -9,13 +9,16 @@ from datetime import datetime
 import concurrent.futures
 
 # ================= 1. 系统配置 =================
-st.set_page_config(page_title="A股操盘手 V42", layout="wide", page_icon="📈")
+st.set_page_config(page_title="A股操盘手 V44", layout="wide", page_icon="⚔️")
 
 # 初始化状态
 if 'watchlist' not in st.session_state: st.session_state.watchlist = {}
 if 'scan_results' not in st.session_state: st.session_state.scan_results = None
 if 'diagnosis_result' not in st.session_state: st.session_state.diagnosis_result = None
 if 'last_update_str' not in st.session_state: st.session_state.last_update_str = "未刷新"
+# 两个分页索引，分别控制两个Tab
+if 'page_idx_attack' not in st.session_state: st.session_state.page_idx_attack = 0
+if 'page_idx_ambush' not in st.session_state: st.session_state.page_idx_ambush = 0
 
 # 数据迁移兼容
 try:
@@ -167,7 +170,7 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
         force_signal = None
         if day1['成交量'] > 2*ma20_vol_s.iloc[-2] and day1['涨跌幅']>4 and day0['收盘']>day1['开盘']: force_signal="🔥昨抢筹"
         elif day0['成交量'] > 2*ma20_vol_s.iloc[-1] and day0['涨跌幅']>4: force_signal="🔥今抢筹"
-        if force_signal: score += 20; reasons.insert(0, force_signal); advice_60m = "🔥 点火"
+        if force_signal: score += 25; reasons.insert(0, force_signal); advice_60m = "🔥 点火"
             
         if is_high_risk: score -= 15; reasons.append("⚠️高位")
         if is_broken: score = min(score, 40); advice_60m="🛑 离场"
@@ -206,56 +209,123 @@ def diagnose_single_stock(code, market_factor, sector_map):
 
 # ================= 5. 绘图与界面 =================
 
-def draw_mini_chart(df):
+def draw_mini_chart_compact(df):
     if df is None: return go.Figure()
     mini_data = df.tail(20)
     fig = go.Figure(go.Candlestick(
         x=mini_data['时间'], open=mini_data['开盘'], high=mini_data['最高'], low=mini_data['最低'], close=mini_data['收盘'],
         increasing_line_color='#ef5350', decreasing_line_color='#26a69a'
     ))
-    fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=60, xaxis=dict(visible=False), yaxis=dict(visible=False), showlegend=False)
+    fig.update_layout(
+        margin=dict(l=0,r=0,t=2,b=2), height=45, 
+        xaxis=dict(visible=False), yaxis=dict(visible=False), 
+        showlegend=False, plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)'
+    )
     return fig
 
 def draw_detail_chart(df, name):
     if df is None: return go.Figure()
-    
     df['MA5'] = df['收盘'].rolling(5).mean()
     df['MA20'] = df['收盘'].rolling(20).mean()
-    
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-    
-    fig.add_trace(go.Candlestick(
-        x=df['日期'], open=df['开盘'], high=df['最高'], low=df['最低'], close=df['收盘'], 
-        name='K线', increasing_line_color='#ef5350', decreasing_line_color='#26a69a'
-    ), row=1, col=1)
-    
+    fig.add_trace(go.Candlestick(x=df['日期'], open=df['开盘'], high=df['最高'], low=df['最低'], close=df['收盘'], name='K线', increasing_line_color='#ef5350', decreasing_line_color='#26a69a'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['日期'], y=df['MA5'], line=dict(color='orange', width=1), name='MA5'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['日期'], y=df['MA20'], line=dict(color='blue', width=1), name='MA20'), row=1, col=1)
-    
     colors = ['#ef5350' if r['收盘'] >= r['开盘'] else '#26a69a' for _, r in df.iterrows()]
     fig.add_trace(go.Bar(x=df['日期'], y=df['成交量'], marker_color=colors, name='成交量'), row=2, col=1)
-    
-    fig.update_layout(
-        title=f"{name} 量价趋势", height=400, xaxis_rangeslider_visible=False, 
-        yaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'),
-        margin=dict(l=10, r=10, t=40, b=10)
-    )
+    fig.update_layout(title=f"{name} 量价趋势", height=400, xaxis_rangeslider_visible=False, yaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.2)'), margin=dict(l=10, r=10, t=40, b=10))
     return fig
+
+# --- 封装列表渲染函数 (复用逻辑) ---
+def render_stock_list(df_subset, page_state_key):
+    if df_subset.empty:
+        st.info("暂无符合该分类的标的")
+        return
+
+    # 分页逻辑
+    items_per_page = 10
+    total_items = len(df_subset)
+    total_pages = max(1, (total_items - 1) // items_per_page + 1)
+    
+    # 获取当前页码
+    current_page = st.session_state[page_state_key]
+    if current_page >= total_pages: current_page = total_pages - 1
+    if current_page < 0: current_page = 0
+    st.session_state[page_state_key] = current_page
+        
+    start_idx = current_page * items_per_page
+    end_idx = min(start_idx + items_per_page, total_items)
+    
+    page_data = df_subset.iloc[start_idx:end_idx]
+    
+    st.caption(f"第 {current_page+1}/{total_pages} 页 | 共 {total_items} 只")
+
+    for idx, row in page_data.iterrows():
+        with st.container(border=True):
+            # 紧凑布局
+            c1, c2, c3, c4, c5 = st.columns([1.5, 1.5, 2.5, 2, 1])
+            
+            with c1:
+                st.markdown(f"**{row['名称']}**")
+                st.caption(f"{row['代码']}")
+                sec_color = "red" if row['板块涨幅'] > 0 else "green"
+                st.markdown(f"<span style='font-size:12px;color:gray'>{row['行业']} <span style='color:{sec_color}'>{row['板块涨幅']:+.1f}%</span></span>", unsafe_allow_html=True)
+
+            with c2:
+                pct_color = "red" if row['涨跌幅'] > 0 else "green"
+                st.markdown(f"<span style='font-size:16px;font-weight:bold;color:{pct_color}'>{row['涨跌幅']:+.2f}%</span>", unsafe_allow_html=True)
+                flow_color = "#c53030" if row['个股资金'] > 0 else "#2f855a"
+                st.markdown(f"<span style='font-size:12px;color:{flow_color};font-weight:bold'>主力 {row['个股资金']:+.2f}亿</span>", unsafe_allow_html=True)
+
+            with c3:
+                tags = row['评分理由'].split(" ")
+                tag_html = ""
+                for t in tags[:3]: 
+                    bg = "#fff5f5" if "主力" in t or "抢筹" in t else "#edf2f7"
+                    tag_html += f"<span style='background:{bg};padding:1px 3px;border-radius:3px;font-size:10px;margin-right:2px;display:inline-block'>{t}</span>"
+                st.markdown(tag_html, unsafe_allow_html=True)
+                st.markdown(f"<span style='font-size:13px'>建议: <span style='color:red;font-weight:bold'>{row['微操建议']}</span></span>", unsafe_allow_html=True)
+                st.caption(f"评分: {row['综合评分']:.0f} | ATR: {row['ATR止损']}%")
+
+            with c4:
+                if row['60分数据'] is not None:
+                    st.plotly_chart(draw_mini_chart_compact(row['60分数据']), use_container_width=True, key=f"mini_{row['代码']}_{page_state_key}")
+            
+            with c5:
+                if row['代码'] not in st.session_state.watchlist:
+                    if st.button("➕", key=f"add_{row['代码']}_{page_state_key}"):
+                        st.session_state.watchlist[row['代码']] = {
+                            'name': row['名称'], 'cost': row['现价'], 'add_time': datetime.now().strftime('%m-%d')
+                        }
+                        st.rerun()
+                else:
+                    st.button("✔", disabled=True, key=f"done_{row['代码']}_{page_state_key}")
+
+    # 分页按钮
+    col_p1, col_p2, col_p3 = st.columns([1, 2, 1])
+    with col_p1:
+        if st.button("⬅️", key=f"prev_{page_state_key}", disabled=(current_page == 0)):
+            st.session_state[page_state_key] -= 1
+            st.rerun()
+    with col_p3:
+        if st.button("➡️", key=f"next_{page_state_key}", disabled=(end_idx >= total_items)):
+            st.session_state[page_state_key] += 1
+            st.rerun()
 
 # --- 侧边栏 ---
 with st.sidebar:
-    st.header("💸 操盘手 V42")
+    st.header("💸 操盘手 V44")
     
-    if st.button("🔄 刷新全市场行情", type="primary"):
-        with st.spinner("同步云端数据中心..."):
+    if st.button("🔄 刷新全市场", type="primary"):
+        with st.spinner("同步云端..."):
             fetch_market_spot_data.clear()
             df = fetch_market_spot_data()
             st.session_state.last_update_str = datetime.now().strftime('%H:%M:%S')
-        st.success(f"已同步 {len(df)} 只股票")
+        st.success(f"已同步 {len(df)} 只")
         time.sleep(0.5)
         st.rerun()
     
-    st.caption(f"数据快照: {st.session_state.last_update_str}")
+    st.caption(f"快照: {st.session_state.last_update_str}")
 
     if st.session_state.watchlist:
         st.markdown("### 👀 重点关注")
@@ -264,9 +334,7 @@ with st.sidebar:
         for code, info in st.session_state.watchlist.items():
             name = info['name']
             cost = info.get('cost', 0)
-            
-            curr = cost
-            pct = 0.0
+            curr, pct = cost, 0.0
             
             if not df_cache.empty:
                 row = df_cache[df_cache['代码'] == str(code)]
@@ -274,18 +342,13 @@ with st.sidebar:
                     curr = float(row.iloc[0]['最新价'])
                     pct = float(row.iloc[0]['涨跌幅'])
             
-            signal_icon = ""
-            if pct > 5.0: signal_icon = "🔥"
-            elif pct > 3.0: signal_icon = "🚀"
-            elif pct < -3.0: signal_icon = "💚"
+            signal_icon = "🔥" if pct > 5.0 else ("🚀" if pct > 3.0 else ("💚" if pct < -3.0 else ""))
             
             with st.container():
                 c1, c2, c3 = st.columns([3.5, 2, 1])
                 c1.markdown(f"**{name}** {signal_icon}", unsafe_allow_html=True)
-                
                 color = "red" if pct > 0 else "green"
                 c2.markdown(f"<span style='color:{color};font-weight:bold'>{pct:+.2f}%</span>", unsafe_allow_html=True)
-                
                 if c3.button("✕", key=f"del_{code}"):
                     del st.session_state.watchlist[code]
                     st.rerun()
@@ -298,12 +361,8 @@ if page == "⚡ 战术扫描":
     col_env1, col_env2 = st.columns(2)
     with col_env1:
         market_status, market_factor = fetch_market_sentiment_cached()
-        # ✅ 修复 BUG：使用标准 if/else 避免乱码
-        if market_factor >= 1.0:
-            st.success(f"🌞 {market_status}")
-        else:
-            st.warning(f"🌩️ {market_status}")
-    
+        if market_factor >= 1.0: st.success(f"🌞 {market_status}")
+        else: st.warning(f"🌩️ {market_status}")
     with col_env2:
         sector_map = fetch_basic_info()
         st.caption("板块数据已就绪")
@@ -312,11 +371,15 @@ if page == "⚡ 战术扫描":
     with col1: st.info("策略：主板 + 资金穿透 + 妖股基因")
     
     if col2.button("🚀 扫描", type="primary"):
-        with st.spinner("正在全市场选股..."):
+        # 重置所有页码
+        st.session_state.page_idx_attack = 0
+        st.session_state.page_idx_ambush = 0
+        
+        with st.spinner("全市场扫描中..."):
             try:
                 df_spot = fetch_market_spot_data()
                 if df_spot.empty:
-                    st.error("请先点击侧边栏【刷新全市场行情】")
+                    st.error("请先刷新全市场")
                 else:
                     mask = (~df_spot['名称'].str.contains("ST") & ~df_spot['代码'].str.startswith(("688", "8", "4", "9")) & (df_spot['换手率'] > 3.0) & (df_spot['市盈率-动态'] < 80))
                     candidates = df_spot[mask].sort_values(by='换手率', ascending=False).head(60)
@@ -333,58 +396,29 @@ if page == "⚡ 战术扫描":
                     if results:
                         st.session_state.scan_results = pd.DataFrame(results).sort_values(by='排序权重', ascending=False)
                         st.success(f"命中 {len(results)} 标的")
-                    else:
-                        st.warning("无标的")
+                    else: st.warning("无标的")
             except Exception as e: st.error(f"Error: {e}")
 
-    # 🔥 全端自适应网格展示
+    # 🔥 V44 核心：分战区分页展示
     if st.session_state.scan_results is not None and not st.session_state.scan_results.empty:
         df_res = st.session_state.scan_results
         
-        # 定义列数：电脑端 3 列，手机端自动变为 1 列
-        cols = st.columns(3)
+        # 1. 自动分流：根据“建议”关键词
+        # 进攻组：起爆、点火、金叉
+        mask_attack = df_res['微操建议'].str.contains("起爆|点火|金叉")
+        df_attack = df_res[mask_attack]
         
-        for i, (idx, row) in enumerate(df_res.iterrows()):
-            # 循环填充列
-            with cols[i % 3]:
-                with st.container(border=True):
-                    # 顶部：名称+涨幅
-                    top1, top2 = st.columns([2, 1])
-                    top1.markdown(f"#### {row['名称']}")
-                    pct_color = "red" if row['涨跌幅'] > 0 else "green"
-                    top2.markdown(f"<h4 style='color:{pct_color};text-align:right'>{row['涨跌幅']:+.2f}%</h4>", unsafe_allow_html=True)
-                    
-                    st.caption(f"代码: {row['代码']} | 行业: {row['行业']}")
-                    
-                    # 关键指标
-                    k1, k2 = st.columns(2)
-                    k1.metric("主力资金", f"{row['个股资金']:+.2f}亿")
-                    k2.metric("综合评分", f"{row['综合评分']:.0f}")
-                    
-                    # 建议与标签
-                    st.markdown(f"**建议:** <span style='color:red'>{row['微操建议']}</span>", unsafe_allow_html=True)
-                    
-                    tags = row['评分理由'].split(" ")
-                    tag_html = ""
-                    for t in tags[:4]: # 最多显示4个标签，防止撑破卡片
-                        color = "#c53030" if "主力" in t else "#4a5568"
-                        bg = "#fff5f5" if "主力" in t else "#edf2f7"
-                        tag_html += f"<span style='color:{color};background:{bg};padding:1px 4px;border-radius:4px;font-size:11px;margin-right:3px;display:inline-block;margin-top:2px'>{t}</span>"
-                    st.markdown(tag_html, unsafe_allow_html=True)
-                    
-                    # 迷你图
-                    if row['60分数据'] is not None:
-                        st.plotly_chart(draw_mini_chart(row['60分数据']), use_container_width=True, key=f"mini_{row['代码']}")
-                    
-                    # 按钮
-                    if row['代码'] not in st.session_state.watchlist:
-                        if st.button("➕ 关注", key=f"add_{row['代码']}", use_container_width=True):
-                            st.session_state.watchlist[row['代码']] = {
-                                'name': row['名称'], 'cost': row['现价'], 'add_time': datetime.now().strftime('%m-%d')
-                            }
-                            st.rerun()
-                    else:
-                        st.button("✅ 已关注", disabled=True, key=f"added_{row['代码']}", use_container_width=True)
+        # 埋伏组：震荡、暂缓、死叉 (剩下的都算)
+        df_ambush = df_res[~mask_attack]
+        
+        # 2. 标签页展示
+        tab1, tab2 = st.tabs([f"🔥 核心进攻 ({len(df_attack)})", f"🕵️ 潜伏埋伏 ({len(df_ambush)})"])
+        
+        with tab1:
+            render_stock_list(df_attack, "page_idx_attack")
+            
+        with tab2:
+            render_stock_list(df_ambush, "page_idx_ambush")
 
 elif page == "📊 深度诊疗":
     st.title("🏥 个股诊疗")
@@ -410,14 +444,12 @@ elif page == "📊 深度诊疗":
         st.plotly_chart(draw_detail_chart(res['日线数据'], res['名称']), use_container_width=True)
         
         if res['代码'] not in st.session_state.watchlist:
-            if st.button(f"➕ 加入自选 ({res['名称']})"):
+            if st.button(f"➕ 加入自选 ({res['名称']})", use_container_width=True):
                 st.session_state.watchlist[res['代码']] = {'name': res['名称'], 'cost': res['现价'], 'add_time': datetime.now().strftime('%m-%d')}
                 st.rerun()
 
 elif page == "📂 资产看板":
     st.title("📂 资产看板")
-    st.caption(f"数据快照: {st.session_state.last_update_str}")
-    
     if not st.session_state.watchlist:
         st.info("暂无自选股")
     else:
@@ -426,7 +458,6 @@ elif page == "📂 资产看板":
         for code, info in st.session_state.watchlist.items():
             curr = info.get('cost', 0)
             daily_pct = 0.0
-            
             if not df_cache.empty:
                 row = df_cache[df_cache['代码'] == str(code)]
                 if not row.empty:
@@ -437,11 +468,12 @@ elif page == "📂 资产看板":
             total_gain = (curr - cost) / cost * 100 if cost > 0 else 0
             
             with st.container(border=True):
-                c1, c2 = st.columns([2, 1])
-                c1.markdown(f"### {info['name']} <span style='font-size:12px;color:gray'>{code}</span>", unsafe_allow_html=True)
-                
+                c1, c2, c3 = st.columns([2, 1, 1])
+                c1.markdown(f"**{info['name']}** <span style='color:gray'>{code}</span>", unsafe_allow_html=True)
                 pct_color = "red" if daily_pct > 0 else "green"
-                c2.markdown(f"<h3 style='color:{pct_color};text-align:right'>{daily_pct:+.2f}%</h3>", unsafe_allow_html=True)
+                c1.markdown(f"现价: {curr} (<span style='color:{pct_color}'>{daily_pct:+.2f}%</span>)", unsafe_allow_html=True)
                 
-                st.markdown(f"**现价:** ¥{curr} &nbsp;&nbsp; **成本:** ¥{cost}")
-                st.progress(min(100, max(0, int(50 + total_gain))), text=f"累计盈亏: {total_gain:+.2f}%")
+                c2.metric("累计盈亏", f"{total_gain:+.2f}%")
+                if c3.button("删除", key=f"rm_{code}"):
+                    del st.session_state.watchlist[code]
+                    st.rerun()
