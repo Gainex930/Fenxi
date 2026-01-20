@@ -9,7 +9,7 @@ from datetime import datetime
 import concurrent.futures
 
 # ================= 1. 系统配置 =================
-st.set_page_config(page_title="A股操盘手 V46", layout="wide", page_icon="🔥")
+st.set_page_config(page_title="A股操盘手 V47", layout="wide", page_icon="🎲")
 
 # 初始化状态
 if 'watchlist' not in st.session_state: st.session_state.watchlist = {}
@@ -33,7 +33,6 @@ except: pass
 def fetch_basic_info():
     try:
         df_sector = ak.stock_board_industry_name_em()
-        # 返回原生 DataFrame 方便排序，同时返回字典方便查询
         sector_map = dict(zip(df_sector['板块名称'], df_sector['涨跌幅']))
         return df_sector, sector_map
     except: return pd.DataFrame(), {}
@@ -56,7 +55,7 @@ def fetch_market_sentiment_cached():
         else: return "🌧️ 大盘空头 (轻仓)", 0.8
     except: return "未知环境", 1.0
 
-# ================= 3. 基础算法库 =================
+# ================= 3. 基础算法库 (含凯利公式) =================
 
 def calculate_atr(df, period=14):
     high_low = df['最高'] - df['最低']
@@ -74,6 +73,41 @@ def calculate_kdj(df, n=9, m1=3, m2=3):
     d = k.ewm(com=m2-1, adjust=False).mean()
     j = 3 * k - 2 * d
     return k, d, j
+
+# 🔥 新增：凯利公式计算器
+def calculate_kelly(score, win_loss_ratio=2.0):
+    """
+    根据评分估算胜率，进而计算凯利仓位。
+    Args:
+        score: 0-100 的技术评分
+        win_loss_ratio: 盈亏比 (默认为 2:1)
+    Returns:
+        suggested_position: 建议单一标的仓位百分比 (已应用半凯利安全系数)
+    """
+    # 1. 将评分映射为胜率 P (Probability)
+    # 假设：60分=50%胜率，100分=75%胜率 (线性映射)
+    # P = 0.5 + (score - 60) * (0.25 / 40)
+    if score < 60:
+        p = 0.4 # 不及格，胜率极低
+    else:
+        p = 0.5 + (score - 60) * 0.00625
+    
+    p = min(0.8, p) # 胜率封顶 80%，防止过度自信
+    
+    # 2. 凯利公式: f = (bp - q) / b
+    # b = win_loss_ratio
+    # q = 1 - p
+    b = win_loss_ratio
+    q = 1 - p
+    f = (b * p - q) / b
+    
+    # 3. 安全边际：半凯利 (Half-Kelly)
+    # 凯利公式非常激进，实战通常除以 2
+    f_safe = f * 0.5
+    
+    # 4. 格式化输出
+    if f_safe <= 0: return 0.0
+    return round(f_safe * 100, 1) # 返回百分比
 
 def get_individual_fund_flow(code):
     try:
@@ -175,8 +209,13 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
         if is_high_risk: score -= 15; reasons.append("⚠️高位")
         if is_broken: score = min(score, 40); advice_60m="🛑 离场"
         
-        score = max(0.0, min(100.00, score * market_factor))
-        priority = score + (100 if has_gold_cross and not is_broken else 0) + (50 if alpha > 0 else 0) + (30 if individual_flow > 0.5 else 0)
+        # 最终得分计算
+        final_score = max(0.0, min(100.00, score * market_factor))
+        
+        # 🔥 计算凯利建议仓位
+        kelly_pct = calculate_kelly(final_score, win_loss_ratio=2.0)
+        
+        priority = final_score + (100 if has_gold_cross and not is_broken else 0) + (50 if alpha > 0 else 0) + (30 if individual_flow > 0.5 else 0)
         
         recent_day = df_day.tail(30).copy()
         recent_day['日期'] = pd.to_datetime(recent_day['日期']).dt.strftime('%Y-%m-%d')
@@ -185,10 +224,11 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
             "代码": code, "名称": name, "行业": industry, 
             "板块涨幅": sector_pct, "个股资金": individual_flow,
             "现价": current_price, "ATR止损": round(stop_loss_pct, 2),
-            "综合评分": round(score, 2), "排序权重": round(priority, 2),
+            "综合评分": round(final_score, 2), "排序权重": round(priority, 2),
             "评分理由": " ".join(reasons), "微操建议": advice_60m,
             "60分数据": df_60m_data, "日线数据": recent_day, "主力信号": force_signal,
-            "换手率": turnover, "涨跌幅": current_pct
+            "换手率": turnover, "涨跌幅": current_pct,
+            "凯利仓位": kelly_pct  # 新增字段
         }
     except: return None
 
@@ -273,14 +313,13 @@ def render_stock_list(df_subset, page_state_key):
                 flow_color = "#c53030" if row['个股资金'] > 0 else "#2f855a"
                 st.markdown(f"<span style='font-size:12px;color:{flow_color};font-weight:bold'>主力 {row['个股资金']:+.2f}亿</span>", unsafe_allow_html=True)
             with c3:
-                tags = row['评分理由'].split(" ")
-                tag_html = ""
-                for t in tags[:3]: 
-                    bg = "#fff5f5" if "主力" in t or "抢筹" in t else "#edf2f7"
-                    tag_html += f"<span style='background:{bg};padding:1px 3px;border-radius:3px;font-size:10px;margin-right:2px;display:inline-block'>{t}</span>"
-                st.markdown(tag_html, unsafe_allow_html=True)
+                # 凯利仓位标签
+                kelly_val = row['凯利仓位']
+                kelly_color = "#9c27b0" if kelly_val > 20 else ("#1976d2" if kelly_val > 10 else "#607d8b")
+                st.markdown(f"<span style='background:#f3e5f5;color:{kelly_color};padding:2px 5px;border-radius:4px;font-weight:bold;font-size:12px'>🎲 凯利: {kelly_val}%</span>", unsafe_allow_html=True)
+                
                 st.markdown(f"<span style='font-size:13px'>建议: <span style='color:red;font-weight:bold'>{row['微操建议']}</span></span>", unsafe_allow_html=True)
-                st.caption(f"评分: {row['综合评分']:.0f} | ATR: {row['ATR止损']}%")
+                st.caption(f"评分: {row['综合评分']:.0f}")
             with c4:
                 if row['60分数据'] is not None:
                     st.plotly_chart(draw_mini_chart_compact(row['60分数据']), use_container_width=True, key=f"mini_{row['代码']}_{page_state_key}")
@@ -306,7 +345,7 @@ def render_stock_list(df_subset, page_state_key):
 
 # --- 侧边栏 ---
 with st.sidebar:
-    st.header("💸 操盘手 V46")
+    st.header("💸 操盘手 V47")
     
     if st.button("🔄 刷新全市场", type="primary"):
         with st.spinner("同步云端..."):
@@ -359,7 +398,6 @@ if page == "⚡ 战术扫描":
         
     with col_env2:
         df_sec, sector_map = fetch_basic_info()
-        # 🔥 V46 核心：板块热力展示
         if not df_sec.empty:
             df_sec = df_sec.sort_values(by='涨跌幅', ascending=False)
             top5 = df_sec.head(5)
@@ -380,7 +418,7 @@ if page == "⚡ 战术扫描":
 
     st.markdown("---")
     col1, col2 = st.columns([4, 1])
-    with col1: st.info("策略：主板 + 资金穿透 + 妖股基因")
+    with col1: st.info("策略：资金穿透 + 妖股基因 + **凯利风控**")
     
     if col2.button("🚀 扫描", type="primary"):
         st.session_state.page_idx_attack = 0
@@ -437,7 +475,8 @@ elif page == "📊 深度诊疗":
         res = st.session_state.diagnosis_result
         k1, k2, k3 = st.columns(3)
         k1.metric("综合评分", f"{res['综合评分']:.0f}")
-        k2.metric("建议", res['微操建议'])
+        # 显示凯利仓位
+        k2.metric("建议仓位(Kelly)", f"{res['凯利仓位']}%")
         k3.metric("资金", f"{res['个股资金']:+.2f}亿")
         
         st.info(res['评分理由'])
