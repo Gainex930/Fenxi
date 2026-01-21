@@ -11,67 +11,91 @@ import concurrent.futures
 from github import Github, GithubException
 
 # ================= 1. 系统配置 =================
-st.set_page_config(page_title="A股操盘手 V54", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="A股操盘手 V55 (云端增强版)", layout="wide", page_icon="⚡")
 
 # --- 核心：GitHub 云端持久化层 ---
 USER_DATA_FILE = "sentinel_userdata.json"
 MARKET_DATA_FILE = "market_snapshot.json"
 
 def get_github_repo():
+    """获取 GitHub 仓库对象"""
     try:
+        # 优先尝试从 secrets 获取，如果没有则返回 None
+        if "GITHUB_TOKEN" not in st.secrets:
+            return None
         token = st.secrets["GITHUB_TOKEN"]
         repo_name = st.secrets["REPO_NAME"]
         g = Github(token)
         return g.get_repo(repo_name)
     except Exception as e:
+        # print(f"GitHub 连接失败: {e}") # 调试用
         return None
 
 def load_userdata():
+    """加载用户自选和持仓数据"""
     if 'user_data_loaded' in st.session_state:
         return {"watchlist": st.session_state.watchlist, "portfolio": st.session_state.strategy_portfolio}
+    
     repo = get_github_repo()
-    if not repo: return {"watchlist": {}, "portfolio": {}}
+    if not repo: 
+        return {"watchlist": {}, "portfolio": {}}
+        
     try:
         contents = repo.get_contents(USER_DATA_FILE)
         data = json.loads(contents.decoded_content.decode("utf-8"))
         st.session_state.user_data_loaded = True
         return data
-    except Exception: return {"watchlist": {}, "portfolio": {}}
+    except Exception:
+        # 文件不存在或解析失败，返回空结构
+        return {"watchlist": {}, "portfolio": {}}
 
 def save_userdata():
+    """保存用户数据到 GitHub"""
     repo = get_github_repo()
     if not repo: return
+    
     data = {
         "watchlist": st.session_state.watchlist,
         "portfolio": st.session_state.strategy_portfolio,
         "last_save": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
     json_str = json.dumps(data, ensure_ascii=False, indent=4)
+    
     try:
-        contents = repo.get_contents(USER_DATA_FILE)
-        repo.update_file(path=USER_DATA_FILE, message="[Auto] User Data", content=json_str, sha=contents.sha)
-    except Exception:
-        try: repo.create_file(path=USER_DATA_FILE, message="[Init] User Data", content=json_str)
-        except: pass
+        try:
+            contents = repo.get_contents(USER_DATA_FILE)
+            repo.update_file(path=USER_DATA_FILE, message="[Auto] User Data", content=json_str, sha=contents.sha)
+        except Exception:
+            repo.create_file(path=USER_DATA_FILE, message="[Init] User Data", content=json_str)
+    except Exception as e:
+        st.error(f"保存用户数据失败: {e}")
 
 def save_market_snapshot(df):
+    """保存行情快照到 GitHub"""
     repo = get_github_repo()
-    if not repo: return
+    if not repo: 
+        st.error("未配置 GitHub Token，无法备份行情！")
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
     utc_now = datetime.utcnow()
     bj_now = utc_now + timedelta(hours=8)
     time_str = bj_now.strftime('%Y-%m-%d %H:%M:%S')
+    
     snapshot_data = {
         "timestamp": time_str,
         "count": len(df),
         "data": df.to_dict(orient='records')
     }
+    # 使用紧凑格式节省空间
     json_str = json.dumps(snapshot_data, ensure_ascii=False, separators=(',', ':'))
+    
     try:
         try:
             contents = repo.get_contents(MARKET_DATA_FILE)
             repo.update_file(path=MARKET_DATA_FILE, message=f"[Snapshot] {time_str}", content=json_str, sha=contents.sha)
         except Exception:
             repo.create_file(path=MARKET_DATA_FILE, message=f"[Init] {time_str}", content=json_str)
+        
         st.toast(f"✅ 云端备份成功！时间戳: {time_str}")
         return time_str
     except Exception as e:
@@ -79,81 +103,83 @@ def save_market_snapshot(df):
         return time_str
 
 def load_market_snapshot():
+    """从 GitHub 加载行情快照"""
     repo = get_github_repo()
-    if not repo: return pd.DataFrame(), "未连接"
+    if not repo: 
+        return pd.DataFrame(), "未连接GitHub"
+        
     try:
         contents = repo.get_contents(MARKET_DATA_FILE)
         data_packet = json.loads(contents.decoded_content.decode("utf-8"))
         df = pd.DataFrame(data_packet['data'])
-        if '代码' in df.columns:
+        if not df.empty and '代码' in df.columns:
             df['代码'] = df['代码'].astype(str)
         return df, data_packet.get('timestamp', '未知时间')
     except Exception:
         return pd.DataFrame(), "无云端存档"
 
-# ================= 初始化 =================
-with st.spinner("☁️ 正在同步账户数据..."):
-    user_data = load_userdata()
+# ================= 2. 数据接口 (增强版) =================
 
-if 'watchlist' not in st.session_state: st.session_state.watchlist = user_data.get("watchlist", {})
-if 'strategy_portfolio' not in st.session_state: st.session_state.strategy_portfolio = user_data.get("portfolio", {})
-
-if 'market_snapshot' not in st.session_state:
-    st.session_state.market_snapshot = pd.DataFrame()
-    st.session_state.last_update_str = "等待加载..."
-    st.session_state.data_source = "未知"
-    with st.spinner("📥 正在从云端恢复行情..."):
-        df_snap, snap_time = load_market_snapshot()
-        if not df_snap.empty:
-            st.session_state.market_snapshot = df_snap
-            st.session_state.last_update_str = snap_time
-            st.session_state.data_source = "☁️ 云端存档"
-            st.toast(f"已恢复 {snap_time} 的行情数据")
-        else:
-            st.session_state.last_update_str = "无存档"
-
-if 'scan_results' not in st.session_state: st.session_state.scan_results = None
-if 'diagnosis_result' not in st.session_state: st.session_state.diagnosis_result = None
-if 'page_idx_attack' not in st.session_state: st.session_state.page_idx_attack = 0
-if 'page_idx_ambush' not in st.session_state: st.session_state.page_idx_ambush = 0
-
-# ================= 数据接口 =================
 @st.cache_data(ttl=3600*4) 
 def fetch_basic_info():
     try:
         df_sector = ak.stock_board_industry_name_em()
         sector_map = dict(zip(df_sector['板块名称'], df_sector['涨跌幅']))
         return df_sector, sector_map
-    except: return pd.DataFrame(), {}
+    except:
+        return pd.DataFrame(), {}
 
 def download_market_spot_data():
-    try:
-        df = ak.stock_zh_a_spot_em()
-        df['代码'] = df['代码'].astype(str)
-        return df
-    except: return pd.DataFrame()
+    """
+    下载实时行情，包含重试机制，应对云端网络波动
+    """
+    max_retries = 3
+    for i in range(max_retries):
+        try:
+            # 尝试下载
+            df = ak.stock_zh_a_spot_em()
+            
+            if df is not None and not df.empty:
+                # 数据清洗
+                if '代码' in df.columns:
+                    df['代码'] = df['代码'].astype(str)
+                # 简单过滤，去掉无关数据
+                return df
+        except Exception as e:
+            time.sleep(1) # 失败等待1秒
+            continue # 重试
+            
+    return pd.DataFrame() # 此时返回空，由上层处理
 
 @st.cache_data(ttl=600) 
 def fetch_market_sentiment_cached():
     try:
+        # 指数数据通常较小，容易获取
         df = ak.stock_zh_index_daily(symbol="sh000001")
         if df.empty: return "未知", 1.0
         last = df.iloc[-1]
         ma20 = df['close'].rolling(20).mean().iloc[-1]
         if last['close'] > ma20: return "📈 大盘多头 (安全)", 1.0
         else: return "🌧️ 大盘空头 (轻仓)", 0.8
-    except: return "未知环境", 1.0
+    except:
+        return "未知环境", 1.0
 
-# ================= 核心算法 =================
+# ================= 3. 核心算法 (保持不变) =================
 def calculate_atr(df, period=14):
-    high_low = df['最高'] - df['最低']; high_close = np.abs(df['最高'] - df['收盘'].shift()); low_close = np.abs(df['最低'] - df['收盘'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1); true_range = np.max(ranges, axis=1)
+    high_low = df['最高'] - df['最低']
+    high_close = np.abs(df['最高'] - df['收盘'].shift())
+    low_close = np.abs(df['最低'] - df['收盘'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
     return true_range.rolling(period).mean()
 
 def calculate_kdj(df, n=9, m1=3, m2=3):
-    low_list = df['最低'].rolling(window=n).min(); high_list = df['最高'].rolling(window=n).max()
+    low_list = df['最低'].rolling(window=n).min()
+    high_list = df['最高'].rolling(window=n).max()
     rsv = (df['收盘'] - low_list) / (high_list - low_list) * 100
-    k = rsv.ewm(com=m1-1, adjust=False).mean(); d = k.ewm(com=m2-1, adjust=False).mean(); j = 3 * k - 2 * d
+    k = rsv.ewm(com=m1-1, adjust=False).mean()
+    d = k.ewm(com=m2-1, adjust=False).mean()
+    j = 3 * k - 2 * d
     return k, d, j
 
 def calculate_kelly(score, win_loss_ratio=2.0):
@@ -165,7 +191,8 @@ def calculate_kelly(score, win_loss_ratio=2.0):
 
 def get_individual_fund_flow(code):
     try:
-        df = ak.stock_individual_fund_flow(stock=code, market="sh" if code.startswith("6") else "sz")
+        market = "sh" if code.startswith("6") else "sz"
+        df = ak.stock_individual_fund_flow(stock=code, market=market)
         if df.empty: return 0.0
         return float(df.tail(1).iloc[0]['主力净流入-净额']) / 100000000.0 
     except: return 0.0
@@ -179,26 +206,36 @@ def get_stock_industry(code):
 
 def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None, strict_mode=True):
     try:
-        # 1. 基础数据
-        current_price = spot_row['最新价']; current_pct = spot_row['涨跌幅']; pe, turnover = spot_row['市盈率-动态'], spot_row['换手率']
+        # 基础数据
+        current_price = spot_row['最新价']
+        current_pct = spot_row['涨跌幅']
+        pe = spot_row['市盈率-动态']
+        turnover = spot_row['换手率']
         
-        # 2. 网络请求 (最耗时步骤)
+        # ⚠️ 网络请求耗时点
         df_day = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
         if df_day.empty or len(df_day) < 60: return None
         
-        close = df_day['收盘'].iloc[-1]; ma20 = df_day['收盘'].rolling(20).mean().iloc[-1]; ma60 = df_day['收盘'].rolling(60).mean().iloc[-1]
-        vol_5 = df_day['成交量'].tail(5).mean(); vol_20 = df_day['成交量'].tail(20).mean()
+        close = df_day['收盘'].iloc[-1]
+        ma20 = df_day['收盘'].rolling(20).mean().iloc[-1]
+        ma60 = df_day['收盘'].rolling(60).mean().iloc[-1]
+        vol_5 = df_day['成交量'].tail(5).mean()
+        vol_20 = df_day['成交量'].tail(20).mean()
         
-        # 快速过滤 (减少后续计算)
         if strict_mode:
-            if close < ma20: return None # 破位不看
+            if close < ma20: return None 
             if vol_5 < 1.0 * vol_20: return None
         
-        industry = get_stock_industry(code); sector_pct = 0.0
-        if sector_map and industry in sector_map: sector_pct = sector_map[industry]
-        individual_flow = get_individual_fund_flow(code); vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 0
-        atr_val = calculate_atr(df_day).iloc[-1]; stop_loss_pct = (max(0, close - 2 * atr_val) - close) / close * 100
-        bias_60 = (close - ma60) / ma60 * 100; is_high_risk = bias_60 > 30; alpha = current_pct - sector_pct
+        industry = get_stock_industry(code)
+        sector_pct = sector_map.get(industry, 0.0) if sector_map else 0.0
+        
+        individual_flow = get_individual_fund_flow(code)
+        vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 0
+        atr_val = calculate_atr(df_day).iloc[-1]
+        stop_loss_pct = (max(0, close - 2 * atr_val) - close) / close * 100
+        bias_60 = (close - ma60) / ma60 * 100
+        is_high_risk = bias_60 > 30
+        alpha = current_pct - sector_pct
         has_limit_up = (df_day.tail(20)['涨跌幅'] > 9.5).any()
         
         if strict_mode:
@@ -208,7 +245,7 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
         df_60m = ak.stock_zh_a_hist_min_em(symbol=code, period='60', adjust='qfq')
         score = 60.0; reasons = []; is_broken = False
         
-        # 评分逻辑... (略，保持一致)
+        # 评分逻辑
         if 0 < pe < 60: score += 10
         else: score -= 5
         if turnover > 5.0: score += 10
@@ -220,6 +257,7 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
         if has_limit_up: score += 15; reasons.insert(0, "🧬妖股")
         if individual_flow > 0.3: score += 20; reasons.insert(0, f"💸主力+{individual_flow:.1f}亿")
         elif individual_flow < -0.3: score -= 20; reasons.append(f"🩸主力-{abs(individual_flow):.1f}亿")
+        
         advice_60m = "⚖️ 震荡"; df_60m_data = None; has_gold_cross = False
         if not df_60m.empty:
             df_60m['K'], df_60m['D'], _ = calculate_kdj(df_60m)
@@ -228,37 +266,55 @@ def analyze_stock_core(code, name, spot_row, market_factor=1.0, sector_map=None,
                 score += 20; reasons.insert(0, "⚡60分金叉"); advice_60m="💎 起爆"; has_gold_cross = True
             elif last_60['K'] < last_60['D']: score -= 10; reasons.append("⏳60分死叉"); advice_60m="✋ 回调"
             df_60m_data = df_60m
-        day0, day1 = df_day.iloc[-1], df_day.iloc[-2]; ma20_vol_s = df_day['成交量'].rolling(20).mean(); force_signal = None
+            
+        day0, day1 = df_day.iloc[-1], df_day.iloc[-2]
+        ma20_vol_s = df_day['成交量'].rolling(20).mean()
+        force_signal = None
         if day1['成交量'] > 2*ma20_vol_s.iloc[-2] and day1['涨跌幅']>4 and day0['收盘']>day1['开盘']: force_signal="🔥昨抢筹"
         elif day0['成交量'] > 2*ma20_vol_s.iloc[-1] and day0['涨跌幅']>4: force_signal="🔥今抢筹"
+        
         if force_signal: score += 25; reasons.insert(0, force_signal); advice_60m = "🔥 点火"
         if is_high_risk: score -= 15; reasons.append("⚠️高位")
         if is_broken: score = min(score, 40); advice_60m="🛑 离场"
+        
         final_score = max(0.0, min(100.00, score * market_factor))
         kelly_pct = calculate_kelly(final_score, win_loss_ratio=2.0)
         priority = final_score + (100 if has_gold_cross and not is_broken else 0) + (50 if alpha > 0 else 0) + (30 if individual_flow > 0.5 else 0)
-        recent_day = df_day.tail(30).copy(); recent_day['日期'] = pd.to_datetime(recent_day['日期']).dt.strftime('%Y-%m-%d')
+        
+        recent_day = df_day.tail(30).copy()
+        recent_day['日期'] = pd.to_datetime(recent_day['日期']).dt.strftime('%Y-%m-%d')
+        
         return {
             "代码": code, "名称": name, "行业": industry, "板块涨幅": sector_pct, "个股资金": individual_flow,
             "现价": current_price, "ATR止损": round(stop_loss_pct, 2), "综合评分": round(final_score, 2), "排序权重": round(priority, 2),
             "评分理由": " ".join(reasons), "微操建议": advice_60m, "60分数据": df_60m_data, "日线数据": recent_day, "主力信号": force_signal,
             "换手率": turnover, "涨跌幅": current_pct, "凯利仓位": kelly_pct
         }
-    except: return None
+    except Exception:
+        return None
 
-def analyze_stock_task(args): return analyze_stock_core(args[0], args[1], args[2], args[3], args[4], strict_mode=True)
+def analyze_stock_task(args): 
+    return analyze_stock_core(args[0], args[1], args[2], args[3], args[4], strict_mode=True)
 
 def diagnose_single_stock(code, market_factor, sector_map):
     try:
-        if 'market_snapshot' in st.session_state and not st.session_state.market_snapshot.empty: spot = st.session_state.market_snapshot
-        else: return None, "请先点击左侧【刷新全市场】以加载基础数据"
+        if 'market_snapshot' in st.session_state and not st.session_state.market_snapshot.empty: 
+            spot = st.session_state.market_snapshot
+        else: 
+            # 如果快照为空，尝试临时下载单个数据
+            spot = ak.stock_zh_a_spot_em()
+            if spot.empty: return None, "无法获取市场数据"
+        
+        if '代码' in spot.columns: spot['代码'] = spot['代码'].astype(str)
         row = spot[spot['代码'] == code]
-        if row.empty: return None, "代码不存在或不在主板列表"
+        
+        if row.empty: return None, "代码不存在或未在列表中"
+        
         res = analyze_stock_core(code, row.iloc[0]['名称'], row.iloc[0], market_factor, sector_map, strict_mode=False)
         return res, None
     except Exception as e: return None, str(e)
 
-# ================= 绘图与 UI =================
+# ================= 4. 绘图与 UI =================
 def draw_mini_chart_compact(df):
     if df is None: return go.Figure()
     mini_data = df.tail(20)
@@ -320,16 +376,65 @@ def render_stock_list(df_subset, page_state_key):
     with c3: 
         if st.button("➡️", key=f"next_{page_state_key}", disabled=(end_idx >= total_items)): st.session_state[page_state_key] += 1; st.rerun()
 
+# ================= 5. 初始化与主流程 =================
+
+with st.spinner("☁️ 正在同步账户数据..."):
+    user_data = load_userdata()
+
+if 'watchlist' not in st.session_state: st.session_state.watchlist = user_data.get("watchlist", {})
+if 'strategy_portfolio' not in st.session_state: st.session_state.strategy_portfolio = user_data.get("portfolio", {})
+
+# 增强的初始化逻辑
+if 'market_snapshot' not in st.session_state or st.session_state.market_snapshot.empty:
+    st.session_state.market_snapshot = pd.DataFrame()
+    st.session_state.last_update_str = "等待加载..."
+    st.session_state.data_source = "未知"
+    
+    # 1. 优先尝试云端恢复 (最快且不被封)
+    df_snap, snap_time = load_market_snapshot()
+    
+    if not df_snap.empty:
+        st.session_state.market_snapshot = df_snap
+        st.session_state.last_update_str = snap_time
+        st.session_state.data_source = "☁️ 云端存档"
+        st.toast(f"已恢复 {snap_time} 的行情数据")
+    else:
+        # 2. 如果云端没有，才尝试实时下载 (容易被墙)
+        with st.spinner("🌐 云端无存档，正在尝试连接交易所..."):
+            df_live = download_market_spot_data()
+            if not df_live.empty:
+                st.session_state.market_snapshot = df_live
+                st.session_state.last_update_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                st.session_state.data_source = "🌐 实时抓取"
+            else:
+                st.session_state.data_source = "⚠️ 连接失败"
+                st.error("无法获取数据。请在本地运行并点击刷新以推送到云端。")
+
+if 'scan_results' not in st.session_state: st.session_state.scan_results = None
+if 'diagnosis_result' not in st.session_state: st.session_state.diagnosis_result = None
+if 'page_idx_attack' not in st.session_state: st.session_state.page_idx_attack = 0
+if 'page_idx_ambush' not in st.session_state: st.session_state.page_idx_ambush = 0
+
 # --- 侧边栏 ---
 with st.sidebar:
-    st.header("💸 操盘手 V54")
+    st.header("💸 操盘手 V55")
+    
+    st.info("💡 提示: 如果云端抓不到数据，请在本地电脑运行此App，点击下方按钮，数据会自动同步到云端。")
+    
     if st.button("🔄 刷新全市场 (并备份)", type="primary"):
-        with st.spinner("📥 1. 下载全市场数据..."):
+        with st.spinner("📥 1. 下载全市场数据 (带重试)..."):
             df = download_market_spot_data()
-        with st.spinner("☁️ 2. 上传至云端数据库..."):
-            saved_time = save_market_snapshot(df)
-            st.session_state.market_snapshot = df; st.session_state.last_update_str = saved_time; st.session_state.data_source = "🔴 实时 (已备份)"
-        st.success(f"已更新 {len(df)} 只标的"); time.sleep(0.5); st.rerun()
+        
+        if not df.empty:
+            with st.spinner("☁️ 2. 上传至云端数据库..."):
+                saved_time = save_market_snapshot(df)
+                st.session_state.market_snapshot = df
+                st.session_state.last_update_str = saved_time
+                st.session_state.data_source = "🔴 实时 (已备份)"
+            st.success(f"已更新 {len(df)} 只标的"); time.sleep(0.5); st.rerun()
+        else:
+            st.error("刷新失败：无法连接到数据源。")
+
     source_color = "red" if "实时" in st.session_state.get('data_source', '') else "blue"
     st.markdown(f"**数据源:** <span style='color:{source_color}'>{st.session_state.get('data_source', '未加载')}</span>", unsafe_allow_html=True)
     st.caption(f"数据时间: {st.session_state.last_update_str}")
@@ -352,7 +457,7 @@ with st.sidebar:
 
     page = st.radio("模式选择:", ["⚡ 战术扫描", "🤖 策略组合", "📊 深度诊疗", "📂 资产看板"])
 
-# --- 主页面 ---
+# --- 主页面内容 ---
 if page == "⚡ 战术扫描":
     col_env1, col_env2 = st.columns([1, 3])
     with col_env1:
@@ -364,29 +469,25 @@ if page == "⚡ 战术扫描":
 
     st.markdown("---")
     
-    # 🔥 V54 新增：扫描深度控制滑块
     c_scan1, c_scan2, c_scan3 = st.columns([2, 2, 1])
     with c_scan1: st.info("策略：资金穿透 + 妖股基因 + **凯利风控**")
-    with c_scan2: scan_depth = st.slider("🔍 扫描深度 (只看前多少名)", 20, 100, 30, help="数字越小，速度越快！推荐30。")
+    with c_scan2: scan_depth = st.slider("🔍 扫描深度 (只看前多少名)", 20, 100, 30, help="数字越小，速度越快！")
     with c_scan3: 
         if st.button("🚀 扫描", type="primary"):
             st.session_state.page_idx_attack = 0; st.session_state.page_idx_ambush = 0
             with st.spinner(f"🚀 正在极速分析 Top {scan_depth} 龙头股..."):
                 try:
-                    if st.session_state.market_snapshot.empty: st.error("无数据，请刷新")
+                    if st.session_state.market_snapshot.empty: st.error("无基础数据，请先刷新全市场")
                     else:
                         df_spot = st.session_state.market_snapshot
-                        # 1. 基础过滤：去除ST、非主板
                         mask = (~df_spot['名称'].str.contains("ST") & ~df_spot['代码'].str.startswith(("688", "8", "4", "9")))
-                        # 2. 预筛选：只取涨幅>0的票 (不做下跌的) 进一步提速
                         mask = mask & (df_spot['涨跌幅'] > 0)
-                        
-                        # 3. 按换手率排序，取前 N 名
                         candidates = df_spot[mask].sort_values(by='换手率', ascending=False).head(scan_depth)
                         
                         tasks = [(r['代码'], r['名称'], r, market_factor, sector_map) for _, r in candidates.iterrows()]
                         results = []
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+                        # 降低线程数以减少被封风险
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                             futures = {executor.submit(analyze_stock_task, t): t for t in tasks}
                             for f in concurrent.futures.as_completed(futures):
                                 res = f.result(); 
@@ -403,7 +504,6 @@ if page == "⚡ 战术扫描":
         with tab1: render_stock_list(df_attack, "page_idx_attack")
         with tab2: render_stock_list(df_ambush, "page_idx_ambush")
 
-# (其他页面保持不变)
 elif page == "🤖 策略组合":
     st.title("🤖 策略组合 (实盘模拟)")
     st.caption("数据已开启硬盘级永久保存。")
@@ -454,7 +554,7 @@ elif page == "📊 深度诊疗":
                 st.session_state.watchlist[res['代码']] = {'name': res['名称'], 'cost': res['现价'], 'buy_time': datetime.now().strftime('%Y-%m-%d %H:%M'), 'highest': res['现价']}; save_userdata(); st.rerun()
 
 elif page == "📂 资产看板":
-    st.title("📂 实盘账户分析 (全域回测)")
+    st.title("📂 实盘账户分析")
     all_holdings = []
     for code, info in st.session_state.watchlist.items(): info['type'] = '手动'; info['code'] = code; all_holdings.append(info)
     for code, info in st.session_state.strategy_portfolio.items(): info['type'] = 'AI'; info['code'] = code; all_holdings.append(info)
